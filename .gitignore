@@ -1,0 +1,10 @@
+# 인증 쿠키(민감) — 커밋 금지
+cookies.txt
+cookies.txt.disabled
+
+# 영구 자막 캐시(수백 MB, 로컬 전용)
+subtitle_cache.db
+
+# 파이썬 빌드 아티팩트
+__pycache__/
+*.pyc
