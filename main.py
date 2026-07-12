@@ -240,11 +240,12 @@ def _resolve_lang(requested: str, available_subs: list, available_auto: list, or
     return requested  # 없으면 그냥 요청값 그대로
 
 
-_SPEAKER_MARKER_RE = re.compile(r"\s*>{2,}\s*")  # ">>" = 화자 전환 표시(읽기엔 노이즈)
+_SPEAKER_MARKER_RE = re.compile(r"\s*>{2,}\s*")   # ">>" = 화자 전환 표시(읽기엔 노이즈)
+_BRACKET_NOISE_RE = re.compile(r"\[[^\]]{1,40}\]")  # [음악] [Music] [박수] [Applause] 등 비발화 주석
 
 
 def _clean_caption_text(text: str) -> str:
-    """자막 원문 정제: HTML 엔티티 디코드 + 화자 전환 표시(>>) 제거.
+    """자막 원문 정제: HTML 엔티티 디코드 + 화자 전환 표시(>>) + 비발화 주석([음악] 등) 제거.
     YouTube VTT/timedtext는 화자 전환을 '&gt;&gt;'로, &를 '&amp;'로 인코딩해 그대로 남긴다.
     → &amp;는 디코드해 원문 &를 살리고('S&P 500'), &gt;&gt;는 디코드 후 화자표시로 제거한다.
     이중 인코딩('&amp;gt;')도 대비해 남은 엔티티가 있으면 한 번 더 unescape 한다."""
@@ -253,6 +254,7 @@ def _clean_caption_text(text: str) -> str:
     decoded = html.unescape(text)
     if re.search(r"&#?\w+;", decoded):  # 이중 인코딩 잔여 엔티티 대비
         decoded = html.unescape(decoded)
+    decoded = _BRACKET_NOISE_RE.sub(" ", decoded)   # [음악]/[Music] 등 효과음 주석 제거
     return _SPEAKER_MARKER_RE.sub(" ", decoded)
 
 
