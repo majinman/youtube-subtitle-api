@@ -8,6 +8,7 @@ from pydantic import BaseModel
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+import html
 import tempfile
 import os
 import json
@@ -239,8 +240,36 @@ def _resolve_lang(requested: str, available_subs: list, available_auto: list, or
     return requested  # 없으면 그냥 요청값 그대로
 
 
+_SPEAKER_MARKER_RE = re.compile(r"\s*>{2,}\s*")  # ">>" = 화자 전환 표시(읽기엔 노이즈)
+
+
+def _clean_caption_text(text: str) -> str:
+    """자막 원문 정제: HTML 엔티티 디코드 + 화자 전환 표시(>>) 제거.
+    YouTube VTT/timedtext는 화자 전환을 '&gt;&gt;'로, &를 '&amp;'로 인코딩해 그대로 남긴다.
+    → &amp;는 디코드해 원문 &를 살리고('S&P 500'), &gt;&gt;는 디코드 후 화자표시로 제거한다.
+    이중 인코딩('&amp;gt;')도 대비해 남은 엔티티가 있으면 한 번 더 unescape 한다."""
+    if not text:
+        return ""
+    decoded = html.unescape(text)
+    if re.search(r"&#?\w+;", decoded):  # 이중 인코딩 잔여 엔티티 대비
+        decoded = html.unescape(decoded)
+    return _SPEAKER_MARKER_RE.sub(" ", decoded)
+
+
+def _sanitize_result(result: dict) -> dict:
+    """응답 직전 자막 텍스트 정제. 신규 추출과 레거시(정제 전) 캐시 응답을 모두 커버한다."""
+    if isinstance(result.get("subtitles"), str):
+        result["subtitles"] = _normalize_subtitle_text(result["subtitles"])
+    segments = result.get("segments")
+    if isinstance(segments, list):
+        for seg in segments:
+            if isinstance(seg, dict) and isinstance(seg.get("text"), str):
+                seg["text"] = _normalize_subtitle_text(seg["text"])
+    return result
+
+
 def _normalize_subtitle_text(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip()
+    return re.sub(r"\s+", " ", _clean_caption_text(text)).strip()
 
 
 def _vtt_to_seconds(ts: str) -> float:
@@ -712,6 +741,7 @@ async def get_subtitles(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"자막 추출 오류: {str(e)}")
 
+    result = _sanitize_result(result)
     result["url"] = body.url
     return result
 
