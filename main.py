@@ -108,6 +108,35 @@ def _yt_mark_429():
         _yt_cooldown_until = time.monotonic() + YT_COOLDOWN_AFTER_429
 
 
+# transcript-api(빠른 경로/번역/언어목록) 전용 경량 페이싱. yt-dlp와 별개 통로지만 같은 IP로
+# YouTube timedtext를 때리므로, 무방비로 두면 연타(다언어 번역·다유저 동시)로 IP throttle에 걸린다.
+# yt-dlp의 12s보다 짧은 최소 간격으로 버스트만 눌러 지연을 최소화한다(+실패 시 쿨다운).
+TAPI_MIN_INTERVAL = float(os.environ.get("TAPI_MIN_INTERVAL", "2.5"))
+TAPI_COOLDOWN_AFTER_FAIL = float(os.environ.get("TAPI_COOLDOWN_AFTER_FAIL", "20"))
+_tapi_throttle_lock = threading.Lock()
+_tapi_last_call = 0.0
+_tapi_cooldown_until = 0.0
+
+
+def _tapi_throttle():
+    """transcript-api가 YouTube를 때리기 직전 호출. 전역 최소 간격 + 실패 쿨다운을 강제한다.
+    락을 잡은 채 대기하므로 동시 요청도 자연히 직렬화된다."""
+    global _tapi_last_call
+    with _tapi_throttle_lock:
+        now = time.monotonic()
+        wait = max(_tapi_cooldown_until - now, _tapi_last_call + TAPI_MIN_INTERVAL - now)
+        if wait > 0:
+            time.sleep(wait + random.uniform(0, 0.3))
+        _tapi_last_call = time.monotonic()
+
+
+def _tapi_mark_fail():
+    """transcript-api 실패(빈 응답/파싱 오류=쓰로틀 징후) 시 쿨다운 윈도우를 설정한다."""
+    global _tapi_cooldown_until
+    with _tapi_throttle_lock:
+        _tapi_cooldown_until = time.monotonic() + TAPI_COOLDOWN_AFTER_FAIL
+
+
 # yt-dlp 자체 재시도/요청간 sleep — 일시적 throttle을 내장 백오프로 흡수한다.
 # extractor_args: web 클라이언트 + 쿠키 + PO Token(bgutil 로컬 서버 :4416)으로 "인증 요청"을 만들어
 # throttle/429를 우회한다(가장 견고). POT는 bgutil-ytdlp-pot-provider 플러그인이 자동 주입하며,
@@ -155,6 +184,7 @@ class SubtitleRequest(BaseModel):
     auto: bool = True
     include_segments: bool = False  # True면 응답에 타임스탬프 cue 배열(segments) 추가 (기본 off로 기존 소비자 응답 불변)
     priority: int = 0  # 높을수록 throttle 대기 큐에서 먼저 처리(ReadNThink 워커가 1로 보냄, 기본 0)
+    translate: bool = False  # True면 lang을 "번역 목표 언어"로 보고 자동번역본을 받는다(원본 트랙이 없는 언어용). transcript-api tlang 단일요청 경로만 사용.
 
 
 class InfoRequest(BaseModel):
@@ -488,6 +518,7 @@ def _fetch_via_transcript_api(video_id: str, lang: str, auto: bool) -> dict:
     딕셔너리를 돌려주고, 실패(자막 없음/IP 차단/네트워크/너무 짧음)하면 예외를 던져 호출부가
     yt-dlp 경로로 폴백하게 한다. title/channel/duration은 이 경로에서 알 수 없어 넣지 않는다
     (ReadNThink는 제목=oEmbed, 길이=segments 끝 → /info 로 보충하므로 회귀 없음)."""
+    _tapi_throttle()
     ytt = YouTubeTranscriptApi()
     tlist = ytt.list(video_id)
 
@@ -540,38 +571,160 @@ def _fast_fetch_sync(video_id: str, lang: str, auto: bool, include_segments: boo
     return result
 
 
-async def fetch_subtitles(video_id: str, lang: str, auto: bool, include_segments: bool = False, priority: int = 0) -> dict:
-    """비동기 래퍼: 우선순위 게이트로 동시성 1 직렬화(대기 시 priority 높은 순), executor로 블로킹 회피"""
-    # 캐시 적중은 YouTube를 때리지 않으므로 throttle 게이트를 건너뛰고 즉시 응답한다.
-    # (게이트 안쪽 _fetch_subtitles_sync에도 체크가 있어 동시 미스의 중복 페치를 막는다.)
-    cached = _subtitle_cache_get(video_id, lang, auto)
-    if cached is not None:
-        result = dict(cached)
-        if include_segments:
-            result.setdefault("segments", [])
-        else:
-            result.pop("segments", None)
-        return result
+def _translate_via_transcript_api(video_id: str, target_lang: str) -> dict:
+    """번역 경로: 영상의 자동/수동 자막 한 트랙을 골라 youtube-transcript-api의 tlang(자동번역)으로
+    target_lang 번역본을 1회 요청한다. 원본 언어 트랙만 존재하는 영상(대부분)에서 임의 언어 자막을
+    얻기 위한 용도. 예전 yt-dlp "lang-.*" 대량 번역과 달리 목표 언어 1개만 받아 429 부담이 낮다.
+    target_lang이 이미 네이티브로 존재하면 번역 없이 그 트랙을 그대로 반환한다."""
+    _tapi_throttle()
+    ytt = YouTubeTranscriptApi()
+    tlist = ytt.list(video_id)
 
-    loop = asyncio.get_event_loop()
+    available_subs: list[str] = []
+    available_auto: list[str] = []
+    for t in tlist:
+        (available_auto if t.is_generated else available_subs).append(t.language_code)
 
-    # ── 빠른 경로: youtube-transcript-api(timedtext 직접 호출). 스로틀 게이트 밖·전용 풀에서 실행해
-    #    yt-dlp보다 훨씬 빠르게 응답한다. 성공하면 여기서 끝. 실패(자막없음/IP차단/네트워크/짧음)하면
-    #    아래 yt-dlp 경로(쿠키+POT+스로틀)로 폴백한다 — yt-dlp의 스로틀 예산을 소비하지 않는 게 핵심.
+    # target_lang이 이미 네이티브로 있으면 번역 불필요 — 그 트랙을 그대로 쓴다.
+    native = None
+    for t in tlist:
+        if t.language_code == target_lang or t.language_code.startswith(target_lang):
+            native = t
+            break
+
+    if native is not None:
+        transcript = native.fetch()
+        resolved_lang = native.language_code
+        translated = False
+    else:
+        # 번역 가능한 소스 트랙 선택(수동 우선, 없으면 자동). is_translatable=False면 건너뛴다.
+        source = None
+        for t in tlist:
+            if getattr(t, "is_translatable", False):
+                source = t
+                break
+        if source is None:
+            raise HTTPException(status_code=422, detail="번역 가능한 자막이 없습니다.")
+        transcript = source.translate(target_lang).fetch()
+        resolved_lang = target_lang
+        translated = True
+
+    raw = transcript.to_raw_data()  # [{"text", "start", "duration"}] (초 단위)
+    entries = [
+        {"start": str(s["start"]), "end": str(s["start"] + s["duration"]), "text": s["text"]}
+        for s in raw
+    ]
+    subtitle_text = _ensure_usable_subtitles(" ".join(s["text"] for s in raw))
+
+    return {
+        "video_id": video_id,
+        "requested_lang": target_lang,
+        "resolved_lang": resolved_lang,
+        "original_lang": "",
+        "auto_caption": True,
+        "translated": translated,
+        "subtitles": subtitle_text,
+        "available_subtitles": available_subs,
+        "available_auto_captions": available_auto,
+        "segments": _build_segments(entries),
+        "source": "transcript-api:translate",
+    }
+
+
+def _translate_fetch_sync(video_id: str, target_lang: str, auto: bool, include_segments: bool) -> dict:
+    """번역 경로 실행 + 캐시. 번역본은 네이티브 트랙과 캐시 충돌을 피하려 lang 키를 "t:<lang>"로 분리한다.
+    transcript-api translate는 YouTube timedtext 쓰로틀/일시 오류로 첫 시도가 빈 응답/실패하는 일이
+    잦아 최대 3회 재시도한다(재시도 없으면 리더가 '자막 못 받음' 에러만 뜨고 언어가 안 바뀜)."""
+    last_error: Exception | None = None
+    result = None
+    attempts = 5
+    for attempt in range(attempts):
+        try:
+            result = _translate_via_transcript_api(video_id, target_lang)
+            break
+        except Exception as error:  # HTTPException(422 등)·네트워크·XML 파싱(쓰로틀 응답) 모두 포함
+            last_error = error
+            _tapi_mark_fail()  # 실패는 쓰로틀 징후 → 후속 호출 쿨다운
+            if attempt < attempts - 1:
+                time.sleep(1.5 * (attempt + 1))  # 1.5, 3, 4.5, 6s 점증 백오프(쓰로틀 회복 대기)
+    if result is None:
+        raise last_error if last_error is not None else HTTPException(status_code=502, detail="자막 번역 실패")
+    _subtitle_cache_put(video_id, f"t:{target_lang}", auto, result)
+    result = dict(result)
+    if include_segments:
+        result.setdefault("segments", [])
+    else:
+        result.pop("segments", None)
+    return result
+
+
+# 동시 동일요청 합치기(in-flight coalescing): 같은 (video_id, cache_lang, auto)를 여러 요청이
+# 동시에 캐시 미스하면 한 번만 실제로 페치하고 나머지는 그 결과를 공유한다. 다유저가 같은 새 영상을
+# 동시에 열 때 YouTube 중복 호출/버스트를 없애 IP throttle을 줄이는 핵심 장치.
+_inflight: dict = {}
+
+
+def _shape_result(result: dict, include_segments: bool) -> dict:
+    """공유/캐시된 result(항상 segments 포함)를 호출자의 include_segments에 맞춰 정형한다."""
+    result = dict(result)
+    if include_segments:
+        result.setdefault("segments", [])
+    else:
+        result.pop("segments", None)
+    return result
+
+
+async def _run_fetch(video_id: str, lang: str, auto: bool, priority: int, translate: bool, loop) -> dict:
+    """실제 페치(항상 segments 포함으로 받아 캐시·공유용 full result 반환). 번역/빠른/yt-dlp 경로 선택."""
+    # ── 번역 경로: transcript-api tlang 단일요청만 사용(원본 트랙이 없는 언어용). yt-dlp 폴백 없음.
+    if translate:
+        return await loop.run_in_executor(fast_executor, _translate_fetch_sync, video_id, lang, auto, True)
+
+    # ── 빠른 경로: youtube-transcript-api(timedtext 직접). 실패(자막없음/IP차단/네트워크/짧음)하면
+    #    아래 yt-dlp 경로(쿠키+POT+스로틀)로 폴백한다.
     try:
-        return await loop.run_in_executor(
-            fast_executor, _fast_fetch_sync, video_id, lang, auto, include_segments
-        )
+        return await loop.run_in_executor(fast_executor, _fast_fetch_sync, video_id, lang, auto, True)
     except Exception as e:
+        _tapi_mark_fail()  # 빠른 경로 실패=쓰로틀 징후 → transcript-api 쿨다운
         print(f"[transcript-api] fallback→yt-dlp ({video_id}): {type(e).__name__}: {e}", flush=True)
 
     await gate.acquire(priority)
     try:
-        return await loop.run_in_executor(
-            executor, _fetch_subtitles_sync, video_id, lang, auto, include_segments
-        )
+        return await loop.run_in_executor(executor, _fetch_subtitles_sync, video_id, lang, auto, True)
     finally:
         await gate.release()
+
+
+async def fetch_subtitles(video_id: str, lang: str, auto: bool, include_segments: bool = False, priority: int = 0, translate: bool = False) -> dict:
+    """비동기 래퍼: 캐시 우선 → in-flight 합치기 → 실제 페치(우선순위 게이트/스로틀)."""
+    # 번역본은 네이티브 트랙과 캐시 충돌을 피하려 lang 키를 "t:<lang>"로 분리한다.
+    cache_lang = f"t:{lang}" if translate else lang
+    # 캐시 적중은 YouTube를 때리지 않으므로 즉시 응답한다.
+    cached = _subtitle_cache_get(video_id, cache_lang, auto)
+    if cached is not None:
+        return _shape_result(cached, include_segments)
+
+    # 같은 요청이 이미 진행 중이면 그 결과를 공유한다(중복 페치 방지). 단일 이벤트루프라
+    # get→create→set 사이에 await가 없어 경쟁 없이 원자적이다.
+    key = (video_id, cache_lang, auto)
+    inflight = _inflight.get(key)
+    if inflight is not None:
+        return _shape_result(await inflight, include_segments)
+
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    _inflight[key] = fut
+    try:
+        result = await _run_fetch(video_id, lang, auto, priority, translate, loop)
+        if not fut.done():
+            fut.set_result(result)
+        return _shape_result(result, include_segments)
+    except BaseException as e:
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        _inflight.pop(key, None)
 
 
 def _run_ytdlp_for_url(url: str, date_compact: str, start_pos: int, end_pos: int) -> list:
@@ -701,6 +854,31 @@ def _fetch_info_sync(video_id: str) -> dict:
     }
 
 
+def _fetch_languages_sync(video_id: str) -> dict:
+    """사용 가능한 자막 언어 목록만 빠르게 조회한다. yt-dlp /info(영상 통째 probe, 수 초~수십 초)보다
+    youtube-transcript-api list()가 훨씬 빠르다(timedtext 목록 1회). translation_targets는 번역
+    가능한 트랙의 translation_languages(자동번역 대상 전체 목록)에서 모은다(리더 언어 메뉴용)."""
+    _tapi_throttle()
+    ytt = YouTubeTranscriptApi()
+    tlist = ytt.list(video_id)
+    native: list[str] = []
+    auto: list[str] = []
+    targets: dict[str, bool] = {}
+    for t in tlist:
+        (auto if t.is_generated else native).append(t.language_code)
+        if getattr(t, "is_translatable", False):
+            for tl in (getattr(t, "translation_languages", None) or []):
+                code = tl.get("language_code") if isinstance(tl, dict) else getattr(tl, "language_code", None)
+                if code:
+                    targets[code] = True
+    return {
+        "video_id": video_id,
+        "available_subtitles": native,
+        "available_auto_captions": auto,
+        "translation_targets": list(targets.keys()),
+    }
+
+
 # ─────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────
@@ -735,7 +913,7 @@ async def get_subtitles(
         raise HTTPException(status_code=400, detail=str(e))
 
     try:
-        result = await fetch_subtitles(video_id, lang=body.lang, auto=body.auto, include_segments=body.include_segments, priority=body.priority)
+        result = await fetch_subtitles(video_id, lang=body.lang, auto=body.auto, include_segments=body.include_segments, priority=body.priority, translate=body.translate)
     except HTTPException:
         raise
     except yt_dlp.utils.DownloadError as e:
@@ -807,3 +985,29 @@ async def get_video_info(
         raise _map_download_error(e)
 
     return result
+
+
+@app.post("/languages", tags=["Info"])
+async def get_languages(
+    body: InfoRequest,
+    token: str = Depends(verify_token),
+):
+    """사용 가능한 자막 언어 목록만 빠르게 조회(transcript-api). 실패 시 yt-dlp /info로 폴백.
+    리더의 언어 전환 드롭다운이 즉답 받도록 만든 경량 엔드포인트."""
+    try:
+        video_id = extract_video_id(body.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(fast_executor, _fetch_languages_sync, video_id)
+    except Exception as fast_error:
+        print(f"[languages] transcript-api 실패→yt-dlp /info 폴백 ({video_id}): {type(fast_error).__name__}", flush=True)
+        try:
+            result = await loop.run_in_executor(executor, _fetch_info_sync, video_id)
+        except yt_dlp.utils.DownloadError as e:
+            raise _map_download_error(e)
+        # /info엔 translation_targets가 없으니 auto 목록을 대체로 쓴다(yt-dlp auto엔 자동번역 대상이 포함됨).
+        result["translation_targets"] = result.get("available_auto_captions", [])
+        return result
