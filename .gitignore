@@ -8,3 +8,5 @@ subtitle_cache.db
 # 파이썬 빌드 아티팩트
 __pycache__/
 *.pyc
+proxies.txt
+cookies.txt.*

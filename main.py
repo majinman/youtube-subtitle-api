@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import GenericProxyConfig
 import re
 import html
 import tempfile
@@ -90,8 +91,9 @@ _yt_cooldown_until = 0.0
 
 
 def _yt_throttle():
-    """yt-dlp의 YouTube 요청 직전 호출. 전역 최소 간격과 429 쿨다운을 강제한다.
+    """yt-dlp의 YouTube 요청 직전 호출. 전역 처리 예산 → 최소 간격 → 429 쿨다운을 차례로 강제한다.
     락을 잡은 채 대기하므로 동시 요청도 자연히 직렬화되어 IP throttle을 피한다."""
+    _yt_budget_acquire()  # 전역 처리 예산(하드 캡) 먼저 소비
     global _yt_last_call
     with _yt_throttle_lock:
         now = time.monotonic()
@@ -119,8 +121,9 @@ _tapi_cooldown_until = 0.0
 
 
 def _tapi_throttle():
-    """transcript-api가 YouTube를 때리기 직전 호출. 전역 최소 간격 + 실패 쿨다운을 강제한다.
+    """transcript-api가 YouTube를 때리기 직전 호출. 전역 처리 예산 → 최소 간격 + 실패 쿨다운을 강제한다.
     락을 잡은 채 대기하므로 동시 요청도 자연히 직렬화된다."""
+    _yt_budget_acquire()  # 전역 처리 예산(하드 캡) 먼저 소비 — yt-dlp 경로와 공유
     global _tapi_last_call
     with _tapi_throttle_lock:
         now = time.monotonic()
@@ -135,6 +138,71 @@ def _tapi_mark_fail():
     global _tapi_cooldown_until
     with _tapi_throttle_lock:
         _tapi_cooldown_until = time.monotonic() + TAPI_COOLDOWN_AFTER_FAIL
+
+
+# ─────────────────────────────────────────────
+# 전역 YouTube 처리 예산(하드 캡, 토큰버킷): yt-dlp·transcript-api 두 경로를 "합쳐서" 분당 최대
+# YT_BUDGET_PER_MIN회만 실제로 YouTube를 때리게 한다. 요청은 무제한 받되 실제 처리 rate를 이 예산이
+# 강제하므로, 아무리 몰려도 버스트가 안 생겨 IP throttle을 원천 차단한다.
+#  - 토큰이 있으면 즉시 소비하고 진행.
+#  - 없으면 리필될 때까지 대기하되, 대기가 YT_BUDGET_MAX_WAIT를 넘으면 503(Retry-After)로 넘겨
+#    소비자(RT 워커)가 나중에 재시도하게 한다(문서 PENDING 유지 → 유실 없음).
+#  - 캐시 적중·번역 등은 스로틀 지점을 안 거치므로 예산을 소모하지 않는다.
+# ─────────────────────────────────────────────
+YT_BUDGET_PER_MIN = float(os.environ.get("YT_BUDGET_PER_MIN", "60"))   # 분당 실제 YouTube 히트 상한
+YT_BUDGET_BURST = float(os.environ.get("YT_BUDGET_BURST", "10"))       # 순간 허용 버스트(토큰 최대치)
+YT_BUDGET_MAX_WAIT = float(os.environ.get("YT_BUDGET_MAX_WAIT", "30")) # 이보다 오래 기다려야 하면 503
+
+_budget_lock = threading.Lock()
+_budget_tat = time.monotonic()  # GCRA theoretical arrival time(다음 토큰이 나는 가상 시각)
+print(f"[budget] YouTube 처리 예산: 분당 {YT_BUDGET_PER_MIN:.0f}회, 버스트 {YT_BUDGET_BURST:.0f}, 최대대기 {YT_BUDGET_MAX_WAIT:.0f}s(초과분 503)", flush=True)
+
+
+def _yt_budget_acquire():
+    """실제 YouTube 히트 직전 호출 — 전역 rate를 GCRA로 강제한다(두 경로 공유).
+    정상 분당 YT_BUDGET_PER_MIN회, 순간 버스트 YT_BUDGET_BURST개까지 허용. 예약 대기가
+    YT_BUDGET_MAX_WAIT 이내면 그만큼(락 밖에서) 대기 후 진행하고, 넘으면 HTTPException(503)."""
+    global _budget_tat
+    interval = 60.0 / YT_BUDGET_PER_MIN                    # 토큰당 방출 간격
+    burst_tol = max(0.0, YT_BUDGET_BURST - 1.0) * interval  # 버스트 허용폭
+    with _budget_lock:
+        now = time.monotonic()
+        tat = max(_budget_tat, now)
+        wait = (tat - burst_tol) - now
+        if wait > YT_BUDGET_MAX_WAIT:
+            raise HTTPException(
+                status_code=503,
+                detail=f"처리 예산 소진(분당 {YT_BUDGET_PER_MIN:.0f}회 제한). {int(wait) + 1}s 후 재시도.",
+                headers={"Retry-After": str(int(wait) + 1)},
+            )
+        _budget_tat = tat + interval  # 슬롯 예약(동시 폭주 시 예약이 쌓여 뒤 요청은 503)
+    if wait > 0:
+        time.sleep(wait)  # 락 밖에서 대기 → 다른 요청은 즉시 자기 예약을 계산(정확한 큐잉)
+
+
+# ── 수동 일시정지(IP 쿨다운): youtube_pause_until 파일에 epoch(초)를 적으면 그 시각까지
+#    자막/언어 조회를 즉시 503으로 막아 YouTube egress를 0으로 만든다. 파일 기반이라
+#    재시작 없이 설정/해제되고, 시각이 지나면 자동 재개된다. (소비자는 503을 retryable로 처리)
+PAUSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "youtube_pause_until")
+
+
+def _pause_remaining() -> float:
+    try:
+        with open(PAUSE_FILE) as f:
+            until = float(f.read().strip())
+    except (FileNotFoundError, ValueError):
+        return 0.0
+    return max(0.0, until - time.time())
+
+
+def _guard_paused():
+    remaining = _pause_remaining()
+    if remaining > 0:
+        raise HTTPException(
+            status_code=503,
+            detail=f"자막 페치 일시정지 중(IP 쿨다운). {int(remaining)}s 후 재개.",
+            headers={"Retry-After": str(int(remaining) + 1)},
+        )
 
 
 # yt-dlp 자체 재시도/요청간 sleep — 일시적 throttle을 내장 백오프로 흡수한다.
@@ -157,6 +225,49 @@ if os.path.exists(COOKIES_FILE):
     print(f"[yt-dlp] 쿠키 사용: {COOKIES_FILE}", flush=True)
 else:
     print(f"[yt-dlp] 쿠키 파일 없음(쿠키 미사용): {COOKIES_FILE}", flush=True)
+
+# ── 레지덴셜 회전 프록시(egress IP 분산): proxies.txt(한 줄에 http://user:pass@host:port)의 IP 풀에서
+#    요청마다 하나를 무작위로 골라 yt-dlp·transcript-api 두 경로로 내보낸다. 어느 IP도 혼자 달궈지지
+#    않아 유튜브 IP밴/429의 근본 해법. 파일이 없거나 비면 집 IP 직결(회귀 없음). PROXY_LIST env로도 주입 가능. ──
+PROXY_FILE = os.environ.get("PROXY_LIST_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt"))
+
+
+def _load_proxy_pool() -> list[str]:
+    raw = os.environ.get("PROXY_LIST", "")
+    entries = [x.strip() for x in raw.replace(",", "\n").splitlines()]
+    if not any(entries) and os.path.exists(PROXY_FILE):
+        with open(PROXY_FILE) as f:
+            entries = [line.strip() for line in f]
+    return [e for e in entries if e and not e.startswith("#")]
+
+
+_PROXY_POOL = _load_proxy_pool()
+if _PROXY_POOL:
+    print(f"[proxy] 레지덴셜 풀 {len(_PROXY_POOL)}개 회전 사용", flush=True)
+else:
+    print("[proxy] 프록시 미설정(집 IP 직결)", flush=True)
+
+
+def _pick_proxy() -> Optional[str]:
+    """풀에서 무작위 프록시 URL 하나. 비었으면 None(직결)."""
+    return random.choice(_PROXY_POOL) if _PROXY_POOL else None
+
+
+def _yt_retry_opts() -> dict:
+    """yt-dlp 옵션 dict(요청별 프록시 회전 주입). 매 호출마다 새 dict를 만든다."""
+    opts = dict(_YT_RETRY_OPTS)
+    proxy = _pick_proxy()
+    if proxy:
+        opts["proxy"] = proxy
+    return opts
+
+
+def _ytt() -> YouTubeTranscriptApi:
+    """transcript-api 인스턴스 팩토리. 풀이 있으면 요청별 프록시를 주입한다(없으면 직결)."""
+    proxy = _pick_proxy()
+    if proxy:
+        return YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy))
+    return YouTubeTranscriptApi()
 
 # ─────────────────────────────────────────────
 # API Key
@@ -449,7 +560,9 @@ def _fetch_subtitles_uncached(video_id: str, lang: str, auto: bool) -> dict:
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     # 1단계: 영상 메타 정보 + 사용 가능한 자막 목록 조회
-    ydl_opts_info = {"skip_download": True, "quiet": True, "no_warnings": True, **_YT_RETRY_OPTS}
+    # ignore_no_formats_error: 자막만 필요하므로 영상 포맷이 없어도(로그인 쿠키 등으로 포맷 추출이
+    # 실패해도) 메타/자막 목록은 반환하게 한다 — 포맷 없다고 자막 추출을 죽이지 않음.
+    ydl_opts_info = {"skip_download": True, "quiet": True, "no_warnings": True, "ignore_no_formats_error": True, **_yt_retry_opts()}
     _yt_throttle()
     with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -477,7 +590,8 @@ def _fetch_subtitles_uncached(video_id: str, lang: str, auto: bool) -> dict:
             "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
-            **_YT_RETRY_OPTS,
+            "ignore_no_formats_error": True,  # 자막만 받으므로 포맷 없어도 진행
+            **_yt_retry_opts(),
         }
         _yt_throttle()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -519,7 +633,7 @@ def _fetch_via_transcript_api(video_id: str, lang: str, auto: bool) -> dict:
     yt-dlp 경로로 폴백하게 한다. title/channel/duration은 이 경로에서 알 수 없어 넣지 않는다
     (ReadNThink는 제목=oEmbed, 길이=segments 끝 → /info 로 보충하므로 회귀 없음)."""
     _tapi_throttle()
-    ytt = YouTubeTranscriptApi()
+    ytt = _ytt()
     tlist = ytt.list(video_id)
 
     available_subs: list[str] = []
@@ -577,7 +691,7 @@ def _translate_via_transcript_api(video_id: str, target_lang: str) -> dict:
     얻기 위한 용도. 예전 yt-dlp "lang-.*" 대량 번역과 달리 목표 언어 1개만 받아 429 부담이 낮다.
     target_lang이 이미 네이티브로 존재하면 번역 없이 그 트랙을 그대로 반환한다."""
     _tapi_throttle()
-    ytt = YouTubeTranscriptApi()
+    ytt = _ytt()
     tlist = ytt.list(video_id)
 
     available_subs: list[str] = []
@@ -684,6 +798,8 @@ async def _run_fetch(video_id: str, lang: str, auto: bool, priority: int, transl
     #    아래 yt-dlp 경로(쿠키+POT+스로틀)로 폴백한다.
     try:
         return await loop.run_in_executor(fast_executor, _fast_fetch_sync, video_id, lang, auto, True)
+    except HTTPException:
+        raise  # 처리 예산 소진(503) 등은 폴백(다른 경로 재시도) 말고 그대로 전파 — 예산 우회 방지
     except Exception as e:
         _tapi_mark_fail()  # 빠른 경로 실패=쓰로틀 징후 → transcript-api 쿨다운
         print(f"[transcript-api] fallback→yt-dlp ({video_id}): {type(e).__name__}: {e}", flush=True)
@@ -838,7 +954,7 @@ def _fetch_channel_videos_sync(channel_url: str, date: str, include_shorts: bool
 
 def _fetch_info_sync(video_id: str) -> dict:
     url = f"https://www.youtube.com/watch?v={video_id}"
-    ydl_opts = {"skip_download": True, "quiet": True, "no_warnings": True, **_YT_RETRY_OPTS}
+    ydl_opts = {"skip_download": True, "quiet": True, "no_warnings": True, **_yt_retry_opts()}
     _yt_throttle()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -859,7 +975,7 @@ def _fetch_languages_sync(video_id: str) -> dict:
     youtube-transcript-api list()가 훨씬 빠르다(timedtext 목록 1회). translation_targets는 번역
     가능한 트랙의 translation_languages(자동번역 대상 전체 목록)에서 모은다(리더 언어 메뉴용)."""
     _tapi_throttle()
-    ytt = YouTubeTranscriptApi()
+    ytt = _ytt()
     tlist = ytt.list(video_id)
     native: list[str] = []
     auto: list[str] = []
@@ -907,6 +1023,7 @@ async def get_subtitles(
     - `lang`: 자막 언어 코드 (기본값: ko)
     - `auto`: 자동 생성 자막 여부 (기본값: true)
     """
+    _guard_paused()
     try:
         video_id = extract_video_id(body.url)
     except ValueError as e:
@@ -994,6 +1111,7 @@ async def get_languages(
 ):
     """사용 가능한 자막 언어 목록만 빠르게 조회(transcript-api). 실패 시 yt-dlp /info로 폴백.
     리더의 언어 전환 드롭다운이 즉답 받도록 만든 경량 엔드포인트."""
+    _guard_paused()
     try:
         video_id = extract_video_id(body.url)
     except ValueError as e:
@@ -1002,6 +1120,8 @@ async def get_languages(
     loop = asyncio.get_event_loop()
     try:
         return await loop.run_in_executor(fast_executor, _fetch_languages_sync, video_id)
+    except HTTPException:
+        raise  # 처리 예산 소진(503) 등은 yt-dlp /info 폴백 말고 그대로 전파
     except Exception as fast_error:
         print(f"[languages] transcript-api 실패→yt-dlp /info 폴백 ({video_id}): {type(fast_error).__name__}", flush=True)
         try:
@@ -1011,3 +1131,48 @@ async def get_languages(
         # /info엔 translation_targets가 없으니 auto 목록을 대체로 쓴다(yt-dlp auto엔 자동번역 대상이 포함됨).
         result["translation_targets"] = result.get("available_auto_captions", [])
         return result
+
+
+# ─────────────────────────────────────────────
+# 일시정지 자동 회복 감시: 정지 중이면 주기적으로 집 IP를 가볍게 찔러보고(캐시 우회=실제 히트),
+# 자막이 받아지면(=IP 회복) youtube_pause_until을 지워 자동 재개한다. 밴 상태면 429만 맞고(주기당 1회,
+# 무해) 계속 대기. pm2가 살아있는 한 항상 동작하고 재시작에도 자동 시작된다.
+# ─────────────────────────────────────────────
+PAUSE_PROBE_INTERVAL = float(os.environ.get("PAUSE_PROBE_INTERVAL", "1800"))  # 감시 주기(초, 기본 30분)
+PAUSE_PROBE_VIDEO = os.environ.get("PAUSE_PROBE_VIDEO", "dQw4w9WgXcQ")        # 회복 판정용 프로브 영상(항상 자막 있음)
+
+
+def _clear_pause():
+    try:
+        os.remove(PAUSE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+async def _pause_auto_recover_loop():
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(PAUSE_PROBE_INTERVAL)
+        if _pause_remaining() <= 0:
+            continue  # 정지 중이 아니면 스킵(재개 후엔 놀고 있음)
+        # 캐시 우회(_fetch_subtitles_uncached 직접) → 실제 YouTube 히트로만 회복 판정.
+        # 429는 확률적이라 한 번 우연히 뚫릴 수 있으므로, 20s 간격 2회 연속 성공해야 해제한다(조기해제 방지).
+        try:
+            await loop.run_in_executor(executor, _fetch_subtitles_uncached, PAUSE_PROBE_VIDEO, "en", True)
+        except Exception as e:
+            print(f"[pause] 아직 회복 안 됨(계속 대기): {type(e).__name__}", flush=True)
+            continue
+        await asyncio.sleep(20)
+        try:
+            await loop.run_in_executor(executor, _fetch_subtitles_uncached, PAUSE_PROBE_VIDEO, "en", True)
+        except Exception as e:
+            print(f"[pause] 1차 성공했으나 확인 프로브 실패({type(e).__name__}) → 아직 불안정, 대기 유지", flush=True)
+            continue
+        _clear_pause()
+        print("[pause] IP 회복 확인(2회 연속) → 일시정지 자동 해제(자막 페치 재개)", flush=True)
+
+
+@app.on_event("startup")
+async def _start_pause_watcher():
+    asyncio.create_task(_pause_auto_recover_loop())
+    print(f"[pause] 자동 회복 감시 시작(주기 {PAUSE_PROBE_INTERVAL:.0f}s)", flush=True)
