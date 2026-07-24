@@ -69,6 +69,33 @@ GET /subtitles?url=https://www.youtube.com/watch?v=VIDEO_ID&lang=ko&auto=true
 }
 ```
 
+### `POST /warm` — 자막 프리워밍 힌트
+
+소비자(tubeletter·rt)가 "새 영상 수요"를 감지해 video_id를 힌트하면, 게이트웨이가 인메모리 큐로 받아
+백그라운드에서 **최저 우선순위 + 전용 페이싱(요청 간 `WARM_MIN_INTERVAL`, 기본 20s)**으로 미리 캐시한다.
+설계 원칙: **수요 감지는 각 소비자가(자기 DB를 아니까), 실행·조율은 게이트웨이가(전역 페이싱을 아니까).**
+소비자 프리워밍 스케줄러들이 서로 모른 채 예산을 두드리는 충돌을 없앤다.
+
+- 기존 캐시/스로틀/예산/degrade를 우회하지 않는다(그 위에 얹기만). 이미 캐시된 영상은 큐에 넣지 않는다.
+- **pause(IP 밴)·429 쿨다운·예산소진(503) 시 큐를 홀드**한다(프리워밍이 throttle을 악화시키지 않음).
+  pause 중 프록시 degrade 경로로는 **절대 태우지 않는다**(프록시 GB를 프리워밍에 쓰지 않음).
+- 큐 상한(`WARM_QUEUE_MAX`, 기본 500) 초과 시 오래된 것부터 drop. 큐 내 중복 video_id는 dedup(재힌트는 no-op).
+- 성공/실패는 `[warm] source/lang/video_id/결과` 로그로 계측된다.
+
+**Headers:** `Authorization: Bearer <API_KEY>`
+
+**Body:**
+
+| 필드 | 타입 | 기본값 | 설명 |
+|------|------|--------|------|
+| `video_ids` | string[] | `[]` | YouTube URL 또는 영상 ID (1회 최대 `WARM_MAX_PER_CALL`=50개, 초과분 무시) |
+| `lang` | string | `ko` | 프리워밍할 자막 언어 |
+| `source` | string | `""` | 계측용(`tubeletter` | `rt`) |
+
+**응답:** `{"queued": n, "skipped_cached": m, "queue_size": k}` (50개 초과 시 `skipped_over_limit` 추가)
+
+**환경변수:** `WARM_MIN_INTERVAL`(20s) · `WARM_QUEUE_MAX`(500) · `WARM_MAX_PER_CALL`(50) · `WARM_PRIORITY`(-1) · `WARM_HOLD_INTERVAL`(30s)
+
 ### `GET /info` — 영상 정보 조회
 
 자막 추출 없이 영상 메타정보 및 사용 가능한 자막 목록만 확인합니다.

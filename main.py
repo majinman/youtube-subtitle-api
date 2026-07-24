@@ -22,6 +22,7 @@ import random
 import heapq
 import itertools
 import sqlite3
+import collections
 
 app = FastAPI(
     title="YouTube Subtitle API",
@@ -320,6 +321,24 @@ def _ytt(force_direct: bool = False, proxy: Optional[str] = None) -> YouTubeTran
     return YouTubeTranscriptApi()
 
 # ─────────────────────────────────────────────
+# 자막 프리워밍(warm) 힌트 큐: 소비자(tubeletter·rt)가 "수요를 감지"해 video_id를 힌트하면,
+# 게이트웨이가 인메모리 큐로 받아 백그라운드에서 "최저 우선순위 + 전용 페이싱"으로 미리 캐시한다.
+# 설계 원칙: 수요 감지는 각 소비자가(자기 DB를 아니까), 실행·조율은 게이트웨이가(전역 페이싱을 아니까).
+#  - 기존 캐시/스로틀/예산/degrade 구조를 우회하지 않고 그대로 통과한다(그 위에 얹기만).
+#  - 프리워밍이 throttle을 악화시키면 안 되므로 pause·429 쿨다운·예산소진(503) 시엔 큐를 홀드한다.
+#  - pause 중 프록시 degrade 경로로는 절대 태우지 않는다(프록시 GB를 프리워밍에 쓰지 않음).
+# ─────────────────────────────────────────────
+WARM_MIN_INTERVAL = float(os.environ.get("WARM_MIN_INTERVAL", "20"))   # warm 요청 간 최소 간격(초)
+WARM_QUEUE_MAX = int(os.environ.get("WARM_QUEUE_MAX", "500"))          # 큐 상한(초과 시 오래된 것부터 drop)
+WARM_MAX_PER_CALL = int(os.environ.get("WARM_MAX_PER_CALL", "50"))     # /warm 1회 최대 video_id 수(초과분 무시)
+WARM_PRIORITY = int(os.environ.get("WARM_PRIORITY", "-1"))            # PriorityGate 우선순위(인터랙티브 0보다 낮게)
+WARM_HOLD_INTERVAL = float(os.environ.get("WARM_HOLD_INTERVAL", "30"))  # pause/429/예산소진 시 큐 홀드 간격(초)
+
+_warm_queue: collections.deque = collections.deque()  # 항목: (video_id, lang)
+_warm_set: set = set()                                 # (video_id, lang) 멤버십(큐 내 중복 제거용)
+
+
+# ─────────────────────────────────────────────
 # API Key
 # ─────────────────────────────────────────────
 API_KEY = os.environ.get("API_KEY", "yt-dlp-secret-key-change-me")
@@ -350,6 +369,12 @@ class SubtitleRequest(BaseModel):
 
 class InfoRequest(BaseModel):
     url: str
+
+
+class WarmRequest(BaseModel):
+    video_ids: list[str] = []          # YouTube URL 또는 영상 ID 목록(최대 WARM_MAX_PER_CALL개)
+    lang: str = "ko"                    # 프리워밍할 자막 언어(기본 ko)
+    source: str = ""                    # 계측용: 어느 소비자가 힌트했는지(tubeletter | rt)
 
 
 class ChannelVideosRequest(BaseModel):
@@ -1286,6 +1311,61 @@ async def get_subtitles(
     return result
 
 
+@app.post("/warm", tags=["Warm"])
+async def warm_subtitles(
+    body: WarmRequest,
+    token: str = Depends(verify_token),
+):
+    """자막 프리워밍 힌트: video_id들을 인메모리 큐에 넣고 즉시 응답한다. 실제 페치는 백그라운드
+    소비자가 최저 우선순위 + 전용 페이싱으로 처리하며, pause/429/예산소진 시엔 큐를 홀드한다.
+
+    **Headers:** `Authorization: Bearer <API_KEY>`
+
+    **Body:** `{"video_ids": ["..."], "lang": "ko", "source": "tubeletter"|"rt"}`
+    **Response:** `{"queued": n, "skipped_cached": m, "queue_size": k}` (+ 초과분 있으면 `skipped_over_limit`)
+    """
+    ids = list(body.video_ids or [])
+    over_limit = 0
+    if len(ids) > WARM_MAX_PER_CALL:
+        over_limit = len(ids) - WARM_MAX_PER_CALL
+        ids = ids[:WARM_MAX_PER_CALL]
+
+    lang = body.lang or "ko"
+    source = body.source or "?"
+    queued = 0
+    skipped_cached = 0
+
+    for raw in ids:
+        try:
+            video_id = extract_video_id(raw)
+        except ValueError:
+            continue  # 잘못된 URL/ID는 조용히 무시(warm은 best-effort)
+        # 이미 캐시된 건 큐에 넣지 않는다(트랜스크립트는 게시 후 불변).
+        if _subtitle_cache_get(video_id, lang, True) is not None:
+            skipped_cached += 1
+            continue
+        key = (video_id, lang)
+        if key in _warm_set:
+            continue  # 큐에 이미 있음 → 재힌트는 무해한 no-op
+        # 큐 상한 초과 시 오래된 것부터 drop.
+        while len(_warm_queue) >= WARM_QUEUE_MAX:
+            old = _warm_queue.popleft()
+            _warm_set.discard(old)
+        _warm_queue.append(key)
+        _warm_set.add(key)
+        queued += 1
+
+    resp = {"queued": queued, "skipped_cached": skipped_cached, "queue_size": len(_warm_queue)}
+    if over_limit:
+        resp["skipped_over_limit"] = over_limit
+    print(
+        f"[warm] hint source={source} lang={lang} queued={queued} skipped_cached={skipped_cached} "
+        f"queue={len(_warm_queue)}" + (f" over_limit={over_limit}" if over_limit else ""),
+        flush=True,
+    )
+    return resp
+
+
 @app.post("/channel/videos", tags=["Channel"])
 async def get_channel_videos(
     body: ChannelVideosRequest,
@@ -1426,7 +1506,60 @@ async def _pause_auto_recover_loop():
         print("[pause] IP 회복 확인(2회 연속) → 일시정지 자동 해제(자막 페치 재개)", flush=True)
 
 
+# ─────────────────────────────────────────────
+# 자막 프리워밍 큐 소비: 큐에서 하나씩 꺼내 최저 우선순위 + 전용 페이싱으로 미리 캐시한다.
+# 기존 캐시/스로틀/예산/degrade를 우회하지 않고 fetch_subtitles를 그대로 재사용한다(그 위에 얹기만).
+# throttle을 악화시키지 않도록 pause·429 쿨다운·예산소진(503)이면 처리를 멈추고 큐를 홀드한다.
+# ─────────────────────────────────────────────
+async def _warm_consumer_loop():
+    while True:
+        if not _warm_queue:
+            await asyncio.sleep(2)
+            continue
+        # pause(직결 IP 밴) 중엔 warm을 태우지 않는다 — 프록시 degrade로 프리워밍하지 않기 위함(GB 보호).
+        if _pause_remaining() > 0:
+            await asyncio.sleep(WARM_HOLD_INTERVAL)
+            continue
+        # 429 쿨다운 중이면 대기(프리워밍이 throttle을 악화시키지 않게).
+        with _yt_throttle_lock:
+            cooling = _yt_cooldown_until - time.monotonic()
+        if cooling > 0:
+            await asyncio.sleep(min(cooling + 1, WARM_HOLD_INTERVAL))
+            continue
+
+        key = _warm_queue.popleft()
+        _warm_set.discard(key)
+        video_id, lang = key
+        # 큐 대기 중 다른 경로로 이미 캐시됐으면 skip(YouTube 무접촉).
+        if _subtitle_cache_get(video_id, lang, True) is not None:
+            continue
+
+        try:
+            await fetch_subtitles(video_id, lang=lang, auto=True, include_segments=False, priority=WARM_PRIORITY, translate=False)
+            print(f"[warm] ok {lang}/{video_id}", flush=True)
+        except HTTPException as e:
+            if e.status_code in (429, 503):
+                # 예산 소진/일시 제한 → 큐 앞으로 되돌리고 잠시 홀드(예산 우회 금지).
+                _warm_queue.appendleft(key)
+                _warm_set.add(key)
+                print(f"[warm] hold {e.status_code} {lang}/{video_id} (재큐)", flush=True)
+                await asyncio.sleep(WARM_HOLD_INTERVAL)
+                continue  # 홀드 후 재시도 — WARM_MIN_INTERVAL 추가 대기는 생략
+            print(f"[warm] fail {e.status_code} {lang}/{video_id}: {e.detail}", flush=True)
+        except Exception as e:
+            print(f"[warm] fail {lang}/{video_id}: {type(e).__name__}: {e}", flush=True)
+
+        # warm 전용 페이싱: 요청 사이 최소 간격(예산의 '빈틈'만 쓰게 한다).
+        await asyncio.sleep(WARM_MIN_INTERVAL)
+
+
 @app.on_event("startup")
 async def _start_pause_watcher():
     asyncio.create_task(_pause_auto_recover_loop())
     print(f"[pause] 자동 회복 감시 시작(주기 {PAUSE_PROBE_INTERVAL:.0f}s)", flush=True)
+
+
+@app.on_event("startup")
+async def _start_warm_consumer():
+    asyncio.create_task(_warm_consumer_loop())
+    print(f"[warm] warm 큐 소비 시작(min_interval={WARM_MIN_INTERVAL:.0f}s, queue_max={WARM_QUEUE_MAX}, priority={WARM_PRIORITY})", flush=True)

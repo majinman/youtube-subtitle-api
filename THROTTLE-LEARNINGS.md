@@ -84,3 +84,6 @@ stage1 `info` dict에 timedtext URL(vtt 포함)이 **이미 다 들어있다**. 
   캐시 히트는 스로틀/예산/pause 우회 즉답(실측 10s→2ms). fetch 경로의 list()는 fetch()에 live TranscriptList가
   필요하고 timedtext URL이 서명·만료 파라미터라 캐시 불가 + 결과는 이미 subtitle_cache가 커버 → 미적용.
 </content>
+
+## 프리워밍은 게이트웨이가 조율 — `POST /warm` 힌트 API (2026-07-24)
+소비자(tubeletter·rt)가 각자 `fetchSubtitles`를 직접 실행하던 프리워밍을 **수요 감지(소비자)+실행·조율(게이트웨이)**로 분리했다. `/warm`은 video_id만 받아 인메모리 큐에 넣고 백그라운드에서 최저 우선순위(-1)+전용 페이싱(20s)+기존 예산/스로틀 통과로 캐시한다. pause·429·예산소진 시 큐 홀드, pause 프록시 degrade엔 안 태움(프리워밍에 프록시 GB 안 씀). 여러 소비자 스케줄러가 서로 모른 채 예산을 두드리던 충돌을 제거.
