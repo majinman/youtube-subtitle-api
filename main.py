@@ -10,7 +10,6 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api.proxies import GenericProxyConfig
 import re
 import html
-import tempfile
 import os
 import json
 from pathlib import Path
@@ -140,6 +139,25 @@ def _tapi_mark_fail():
         _tapi_cooldown_until = time.monotonic() + TAPI_COOLDOWN_AFTER_FAIL
 
 
+# ── 프록시 degrade 전용 경량 페이싱: pause(직결 IP 밴) 중 프록시 경유 요청은 egress가 집 IP가
+#    아니므로, 집 IP 보호용 전역 예산(_yt_budget_acquire)·직결 스로틀(_tapi_throttle)을 소모하면 안 된다.
+#    대신 프록시 서버 보호용 최소 간격만 둔다(버스트만 억제). ──
+PROXY_MIN_INTERVAL = float(os.environ.get("PROXY_MIN_INTERVAL", "1.0"))
+_proxy_pace_lock = threading.Lock()
+_proxy_last_call = 0.0
+
+
+def _proxy_pace():
+    """프록시 경유 호출 직전 최소 간격만 강제(전역 예산·직결 스로틀 미소모)."""
+    global _proxy_last_call
+    with _proxy_pace_lock:
+        now = time.monotonic()
+        wait = _proxy_last_call + PROXY_MIN_INTERVAL - now
+        if wait > 0:
+            time.sleep(wait)
+        _proxy_last_call = time.monotonic()
+
+
 # ─────────────────────────────────────────────
 # 전역 YouTube 처리 예산(하드 캡, 토큰버킷): yt-dlp·transcript-api 두 경로를 "합쳐서" 분당 최대
 # YT_BUDGET_PER_MIN회만 실제로 YouTube를 때리게 한다. 요청은 무제한 받되 실제 처리 rate를 이 예산이
@@ -226,13 +244,19 @@ if os.path.exists(COOKIES_FILE):
 else:
     print(f"[yt-dlp] 쿠키 파일 없음(쿠키 미사용): {COOKIES_FILE}", flush=True)
 
-# ── 레지덴셜 회전 프록시(egress IP 분산): proxies.txt(한 줄에 http://user:pass@host:port)의 IP 풀에서
-#    요청마다 하나를 무작위로 골라 yt-dlp·transcript-api 두 경로로 내보낸다. 어느 IP도 혼자 달궈지지
-#    않아 유튜브 IP밴/429의 근본 해법. 파일이 없거나 비면 집 IP 직결(회귀 없음). PROXY_LIST env로도 주입 가능. ──
+# ── 레지덴셜 회전 프록시(egress IP 분산): 프록시는 예비수단이다.
+#    기본은 집 IP 직결이며, 프록시 풀은 항상 로드해 둔다(아래 두 용도로 쓰임).
+#      1) pause(직결 IP 밴) 중 자동 degrade: 503으로 전면 중단하는 대신, 풀이 있으면 프록시 경유
+#         경량 경로(transcript-api)로만 요청을 살려낸다. 밴이 회복되면 자연히 직결로 복귀.
+#      2) USE_PROXY_POOL=1: 기존처럼 "항상 프록시 강제" 오버라이드(_proxy_forced).
+#    프록시 GB 할당량이 유한하므로, 강제(1)가 아닌 한 평상시엔 프록시를 절대 타지 않는다. ──
 PROXY_FILE = os.environ.get("PROXY_LIST_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt"))
+USE_PROXY_POOL = os.environ.get("USE_PROXY_POOL", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _load_proxy_pool() -> list[str]:
+    # USE_PROXY_POOL과 무관하게 항상 로드한다 — pause 중 degrade에 쓰려면 풀이 준비돼 있어야 하기 때문.
+    # (강제 여부는 별도로 _proxy_forced()가 판단한다.)
     raw = os.environ.get("PROXY_LIST", "")
     entries = [x.strip() for x in raw.replace(",", "\n").splitlines()]
     if not any(entries) and os.path.exists(PROXY_FILE):
@@ -242,10 +266,17 @@ def _load_proxy_pool() -> list[str]:
 
 
 _PROXY_POOL = _load_proxy_pool()
-if _PROXY_POOL:
-    print(f"[proxy] 레지덴셜 풀 {len(_PROXY_POOL)}개 회전 사용", flush=True)
+if _PROXY_POOL and USE_PROXY_POOL:
+    print(f"[proxy] 프록시 풀 {len(_PROXY_POOL)}개 — 항상 프록시 강제(USE_PROXY_POOL=1)", flush=True)
+elif _PROXY_POOL:
+    print(f"[proxy] 프록시 풀 {len(_PROXY_POOL)}개 로드 — 기본 직결, pause(IP 밴) 중에만 프록시 degrade", flush=True)
 else:
-    print("[proxy] 프록시 미설정(집 IP 직결)", flush=True)
+    print("[proxy] 프록시 풀 없음 — 기본 직결, pause 중엔 503", flush=True)
+
+
+def _proxy_forced() -> bool:
+    """USE_PROXY_POOL=1 & 풀 존재: 모든 요청을 프록시로 강제(기존 all-or-nothing 오버라이드)."""
+    return USE_PROXY_POOL and bool(_PROXY_POOL)
 
 
 def _pick_proxy() -> Optional[str]:
@@ -253,18 +284,37 @@ def _pick_proxy() -> Optional[str]:
     return random.choice(_PROXY_POOL) if _PROXY_POOL else None
 
 
-def _yt_retry_opts() -> dict:
-    """yt-dlp 옵션 dict(요청별 프록시 회전 주입). 매 호출마다 새 dict를 만든다."""
+def _is_proxy_quota_error(exc: Exception) -> bool:
+    """예비 프록시 quota/결제 문제면 True. 이때는 메인(직결)으로 재시도한다."""
+    message = str(exc)
+    return (
+        "402 Payment Required" in message
+        or "Tunnel connection failed: 402" in message
+        or "Unable to connect to proxy" in message
+    )
+
+
+def _yt_retry_opts(force_direct: bool = False) -> dict:
+    """yt-dlp 옵션 dict. 기본은 직결, USE_PROXY_POOL=1(강제)일 때만 예비 프록시 주입.
+    예비 프록시 quota 장애 시 force_direct=True로 메인 직결 재시도.
+    프록시를 실제로 태울 때는 옵션을 경량화한다: 재시도 5회는 프록시 GB 낭비의 주범이라 1회로 낮추고,
+    쿠키+프록시 조합은 계정 밴 리스크가 커 cookiefile을 뺀다."""
     opts = dict(_YT_RETRY_OPTS)
-    proxy = _pick_proxy()
+    proxy = None if force_direct else (_pick_proxy() if _proxy_forced() else None)
     if proxy:
         opts["proxy"] = proxy
+        opts["retries"] = 1
+        opts["extractor_retries"] = 1
+        opts.pop("cookiefile", None)
     return opts
 
 
-def _ytt() -> YouTubeTranscriptApi:
-    """transcript-api 인스턴스 팩토리. 풀이 있으면 요청별 프록시를 주입한다(없으면 직결)."""
-    proxy = _pick_proxy()
+def _ytt(force_direct: bool = False, proxy: Optional[str] = None) -> YouTubeTranscriptApi:
+    """transcript-api 인스턴스 팩토리.
+    - proxy 명시(pause degrade): 그 프록시로 강제.
+    - 미명시: USE_PROXY_POOL=1(강제)일 때만 프록시, force_direct=True면 무조건 직결."""
+    if proxy is None and not force_direct and _proxy_forced():
+        proxy = _pick_proxy()
     if proxy:
         return YouTubeTranscriptApi(proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy))
     return YouTubeTranscriptApi()
@@ -537,6 +587,45 @@ def _subtitle_cache_put(video_id: str, lang: str, auto: bool, result: dict):
         _cache_conn.commit()
 
 
+# ── 영구 언어목록 캐시 (sqlite) ──────────────────────────────────────────────
+# /languages 응답(네이티브/자동 언어 + translation_targets)은 트랜스크립트처럼 게시 후 사실상
+# 불변인데, 리더의 언어 드롭다운이 이걸 반복 호출한다. transcript-api list()는 watch HTML을 통째로
+# 받아 영상당 ~345KB나 쓰므로(2026-07-24 실측), video_id 키로 영구 저장해 재호출 시 YouTube를 안 때린다.
+# subtitle_cache와 같은 연결/락을 공유한다(같은 DB 파일).
+_cache_conn.execute(
+    "CREATE TABLE IF NOT EXISTS language_cache ("
+    " video_id TEXT PRIMARY KEY, payload TEXT, created_at REAL)"
+)
+_cache_conn.commit()
+
+
+def _language_cache_get(video_id: str):
+    with _cache_lock:
+        row = _cache_conn.execute(
+            "SELECT payload FROM language_cache WHERE video_id=?", (video_id,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+
+def _language_cache_put(video_id: str, result: dict):
+    try:
+        payload = json.dumps(result, ensure_ascii=False)
+    except Exception:
+        return
+    with _cache_lock:
+        _cache_conn.execute(
+            "INSERT OR REPLACE INTO language_cache (video_id, payload, created_at)"
+            " VALUES (?, ?, ?)",
+            (video_id, payload, time.time()),
+        )
+        _cache_conn.commit()
+
+
 def _fetch_subtitles_sync(video_id: str, lang: str, auto: bool, include_segments: bool = False) -> dict:
     """캐시 우선 래퍼. 성공 결과는 영구 캐시(트랜스크립트는 게시 후 불변)되어 같은 영상 재요청 시
     YouTube를 때리지 않는다 — throttle/429의 실수요 자체를 줄이는 핵심 장치."""
@@ -555,86 +644,139 @@ def _fetch_subtitles_sync(video_id: str, lang: str, auto: bool, include_segments
     return result
 
 
+def _pick_caption_url(info: dict, resolved_lang: str, auto: bool) -> Optional[str]:
+    """1단계 info dict에 이미 담긴 timedtext URL 중 resolved_lang의 vtt URL을 고른다.
+    auto=True면 automatic_captions 우선(없으면 subtitles), auto=False면 그 반대.
+    정확 매칭 실패 시 변형(en-US 등 prefix) 매칭. vtt 포맷이 있으면 vtt, 없으면 첫 URL.
+    → info에 자막 URL이 다 들어있으므로 2차 extract_info(watch/player 재조회) 없이 자막만 직접 받는다."""
+    primary = info.get("automatic_captions" if auto else "subtitles") or {}
+    other = info.get("subtitles" if auto else "automatic_captions") or {}
+    for track_dict in (primary, other):
+        fmts = track_dict.get(resolved_lang)
+        if not fmts:
+            for code in track_dict:  # 변형 매칭(ko-KR/en-US 등)
+                if code == resolved_lang or code.startswith(resolved_lang) or resolved_lang.startswith(code):
+                    fmts = track_dict[code]
+                    break
+        if fmts:
+            for f in fmts:
+                if f.get("ext") == "vtt" and f.get("url"):
+                    return f["url"]
+            for f in fmts:  # vtt 없으면 아무 포맷 URL(파서가 vtt 전제라 이 케이스는 거의 없음)
+                if f.get("url"):
+                    return f["url"]
+    return None
+
+
 def _fetch_subtitles_uncached(video_id: str, lang: str, auto: bool) -> dict:
     """blocking yt-dlp 작업 (ThreadPoolExecutor에서 실행)"""
     url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # 1단계: 영상 메타 정보 + 사용 가능한 자막 목록 조회
+    # 1단계: 영상 메타 정보 + 사용 가능한 자막 목록 조회.
     # ignore_no_formats_error: 자막만 필요하므로 영상 포맷이 없어도(로그인 쿠키 등으로 포맷 추출이
     # 실패해도) 메타/자막 목록은 반환하게 한다 — 포맷 없다고 자막 추출을 죽이지 않음.
+    # ydl 인스턴스를 with로 즉시 닫지 않고 유지한다 → 3단계에서 같은 세션(쿠키/헤더/프록시/POT)으로
+    # info 안의 timedtext URL을 직접 GET하기 위함(2차 extract_info 제거).
     ydl_opts_info = {"skip_download": True, "quiet": True, "no_warnings": True, "ignore_no_formats_error": True, **_yt_retry_opts()}
     _yt_throttle()
-    with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
-        info = ydl.extract_info(url, download=False)
+    ydl = yt_dlp.YoutubeDL(ydl_opts_info)
+    try:
+        try:
+            info = ydl.extract_info(url, download=False)
+        except Exception as exc:
+            if not (_PROXY_POOL and _is_proxy_quota_error(exc)):
+                raise
+            print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(info, {video_id}): {exc}", flush=True)
+            ydl.close()
+            ydl_opts_info = {"skip_download": True, "quiet": True, "no_warnings": True, "ignore_no_formats_error": True, **_yt_retry_opts(force_direct=True)}
+            _yt_throttle()
+            ydl = yt_dlp.YoutubeDL(ydl_opts_info)
+            info = ydl.extract_info(url, download=False)
 
-    title = info.get("title", "")
-    channel = info.get("channel", "")
-    duration = info.get("duration", 0)
-    original_lang = info.get("language") or ""
-    available_subs = list(info.get("subtitles", {}).keys())
-    available_auto = list(info.get("automatic_captions", {}).keys())
+        title = info.get("title", "")
+        channel = info.get("channel", "")
+        duration = info.get("duration", 0)
+        original_lang = info.get("language") or ""
+        available_subs = list(info.get("subtitles", {}).keys())
+        available_auto = list(info.get("automatic_captions", {}).keys())
 
-    # 2단계: 우선순위에 따라 실제 사용할 언어 결정
-    resolved_lang = _resolve_lang(lang, available_subs, available_auto, original_lang)
+        # 2단계: 우선순위에 따라 실제 사용할 언어 결정
+        resolved_lang = _resolve_lang(lang, available_subs, available_auto, original_lang)
 
-    # 3단계: 결정된 언어로 자막 다운로드
-    with tempfile.TemporaryDirectory() as tmpdir:
-        sub_type = "writeautomaticsub" if auto else "writesubtitles"
-        ydl_opts = {
-            "skip_download": True,
-            sub_type: True,
-            # 원본 언어 자막 1개만 받는다. 예전 "lang-.*" 정규식은 자동번역본 수십 개를 한꺼번에
-            # 받아 영상당 timedtext 요청을 폭증시켜 429를 유발했다(필요한 건 원본 트랜스크립트뿐).
-            "subtitleslangs": [resolved_lang],
-            "subtitlesformat": "vtt",
-            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "ignore_no_formats_error": True,  # 자막만 받으므로 포맷 없어도 진행
-            **_yt_retry_opts(),
-        }
-        _yt_throttle()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
-
-        vtt_files = list(Path(tmpdir).glob(f"{video_id}.{resolved_lang}*.vtt"))
-        if not vtt_files:
-            vtt_files = list(Path(tmpdir).glob("*.vtt"))
-
-        if not vtt_files:
+        # 3단계: 1단계 info에 담긴 timedtext URL을 같은 ydl로 직접 GET한다.
+        # 예전엔 여기서 extract_info를 한 번 더 불러 watch/player HTML(영상당 ~660KB)을 통째로
+        # 재조회했는데(실측: 이 재조회가 yt-dlp 경로 바이트의 약 절반), 자막 URL은 이미 info에 다
+        # 들어있어 순수 낭비였다. → 자막 파일(수십 KB)만 직접 받아 재조회 ~660KB를 없앤다.
+        # 예전 "lang-.*" 대량 번역 문제는 이미 원본 1개만 고르는 것으로 해결됐고, 여기서도 1개만 GET한다.
+        cap_url = _pick_caption_url(info, resolved_lang, auto)
+        if not cap_url:
             raise HTTPException(status_code=422, detail="사용 가능한 자막이 없습니다.")
 
-        content = vtt_files[0].read_text(encoding="utf-8")
-        entries = parse_vtt(content)
-        subtitle_text = _ensure_usable_subtitles(" ".join(e["text"] for e in entries))
+        _yt_throttle()  # 자막 GET도 YouTube 히트 → 기존 3단계와 동일하게 페이싱한다.
+        try:
+            content = ydl.urlopen(cap_url).read().decode("utf-8", "replace")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if _PROXY_POOL and _is_proxy_quota_error(exc):
+                print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(caption, {video_id}): {exc}", flush=True)
+                ydl.close()
+                ydl = yt_dlp.YoutubeDL({"skip_download": True, "quiet": True, "no_warnings": True, "ignore_no_formats_error": True, **_yt_retry_opts(force_direct=True)})
+                _yt_throttle()
+                try:
+                    content = ydl.urlopen(cap_url).read().decode("utf-8", "replace")
+                except HTTPException:
+                    raise
+                except Exception as exc2:
+                    raise _map_download_error(exc2)  # 429 등 → 적절한 상태코드 매핑 + _yt_mark_429 쿨다운
+            else:
+                # ydl.urlopen은 DownloadError가 아닌 networking HTTPError(429 등)를 던진다.
+                # 예전 extract_info(download=True) 경로가 DownloadError→_map_download_error로 얻던
+                # 429 매핑/쿨다운을 여기서도 동일하게 유지한다(그냥 raise하면 상위에서 500이 됨).
+                raise _map_download_error(exc)
+    finally:
+        ydl.close()
 
-        result = {
-            "video_id": video_id,
-            "title": title,
-            "channel": channel,
-            "duration": duration,
-            "requested_lang": lang,
-            "resolved_lang": resolved_lang,
-            "original_lang": original_lang,
-            "auto_caption": auto,
-            "subtitles": subtitle_text,
-            "available_subtitles": available_subs,
-            "available_auto_captions": available_auto,
-        }
-        # segments는 항상 계산해 캐시에 저장한다(응답 포함 여부는 캐시 래퍼에서 결정).
-        result["segments"] = _build_segments(entries)
-        return result
+    entries = parse_vtt(content)
+    subtitle_text = _ensure_usable_subtitles(" ".join(e["text"] for e in entries))
+
+    result = {
+        "video_id": video_id,
+        "title": title,
+        "channel": channel,
+        "duration": duration,
+        "requested_lang": lang,
+        "resolved_lang": resolved_lang,
+        "original_lang": original_lang,
+        "auto_caption": auto,
+        "subtitles": subtitle_text,
+        "available_subtitles": available_subs,
+        "available_auto_captions": available_auto,
+    }
+    # segments는 항상 계산해 캐시에 저장한다(응답 포함 여부는 캐시 래퍼에서 결정).
+    result["segments"] = _build_segments(entries)
+    return result
 
 
-def _fetch_via_transcript_api(video_id: str, lang: str, auto: bool) -> dict:
+def _fetch_via_transcript_api(video_id: str, lang: str, auto: bool, proxy: Optional[str] = None) -> dict:
     """빠른 경로: youtube-transcript-api로 timedtext를 직접 1회 요청해 자막을 받는다
     (yt-dlp의 메타 probe + VTT 다운로드보다 훨씬 빠름). 성공 시 yt-dlp 경로와 동일한 result
     딕셔너리를 돌려주고, 실패(자막 없음/IP 차단/네트워크/너무 짧음)하면 예외를 던져 호출부가
     yt-dlp 경로로 폴백하게 한다. title/channel/duration은 이 경로에서 알 수 없어 넣지 않는다
-    (ReadNThink는 제목=oEmbed, 길이=segments 끝 → /info 로 보충하므로 회귀 없음)."""
-    _tapi_throttle()
-    ytt = _ytt()
-    tlist = ytt.list(video_id)
+    (ReadNThink는 제목=oEmbed, 길이=segments 끝 → /info 로 보충하므로 회귀 없음).
+    proxy 명시(pause degrade): 그 프록시로 강제하고 경량 페이싱만 쓰며, 직결 폴백은 하지 않는다
+    (직결 IP가 밴된 상태라 직결 재시도가 무의미)."""
+    via_proxy = proxy is not None
+    (_proxy_pace if via_proxy else _tapi_throttle)()
+    ytt = _ytt(proxy=proxy)
+    try:
+        tlist = ytt.list(video_id)
+    except Exception as exc:
+        if via_proxy or not (_PROXY_POOL and _is_proxy_quota_error(exc)):
+            raise
+        print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(transcript-list, {video_id}): {exc}", flush=True)
+        _tapi_throttle()
+        tlist = _ytt(force_direct=True).list(video_id)
 
     available_subs: list[str] = []
     available_auto: list[str] = []
@@ -685,14 +827,23 @@ def _fast_fetch_sync(video_id: str, lang: str, auto: bool, include_segments: boo
     return result
 
 
-def _translate_via_transcript_api(video_id: str, target_lang: str) -> dict:
+def _translate_via_transcript_api(video_id: str, target_lang: str, proxy: Optional[str] = None) -> dict:
     """번역 경로: 영상의 자동/수동 자막 한 트랙을 골라 youtube-transcript-api의 tlang(자동번역)으로
     target_lang 번역본을 1회 요청한다. 원본 언어 트랙만 존재하는 영상(대부분)에서 임의 언어 자막을
     얻기 위한 용도. 예전 yt-dlp "lang-.*" 대량 번역과 달리 목표 언어 1개만 받아 429 부담이 낮다.
-    target_lang이 이미 네이티브로 존재하면 번역 없이 그 트랙을 그대로 반환한다."""
-    _tapi_throttle()
-    ytt = _ytt()
-    tlist = ytt.list(video_id)
+    target_lang이 이미 네이티브로 존재하면 번역 없이 그 트랙을 그대로 반환한다.
+    proxy 명시(pause degrade): 그 프록시로 강제 + 경량 페이싱, 직결 폴백 없음."""
+    via_proxy = proxy is not None
+    (_proxy_pace if via_proxy else _tapi_throttle)()
+    ytt = _ytt(proxy=proxy)
+    try:
+        tlist = ytt.list(video_id)
+    except Exception as exc:
+        if via_proxy or not (_PROXY_POOL and _is_proxy_quota_error(exc)):
+            raise
+        print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(transcript-list, {video_id}): {exc}", flush=True)
+        _tapi_throttle()
+        tlist = _ytt(force_direct=True).list(video_id)
 
     available_subs: list[str] = []
     available_auto: list[str] = []
@@ -772,6 +923,69 @@ def _translate_fetch_sync(video_id: str, target_lang: str, auto: bool, include_s
     return result
 
 
+# ── pause(직결 IP 밴) 중 프록시 degrade 경로 ─────────────────────────────────
+#    직결이 밴돼 503으로 전면 중단하는 대신, 프록시 풀이 있으면 프록시 경유 "경량" 경로로 요청을 살린다.
+#    경량 규칙: transcript-api(빠른/번역)만 사용하고 무거운 yt-dlp 폴백은 절대 타지 않는다.
+#    transcript-api가 실패하면 yt-dlp를 프록시로 태우지 않고 retryable 503(Retry-After)으로 넘겨,
+#    직결이 회복된 뒤 소비자가 재시도하게 한다(유실 없음). ──
+PROXY_DEGRADE_RETRY_AFTER = int(os.environ.get("PROXY_DEGRADE_RETRY_AFTER", "60"))
+
+
+def _proxy_degrade_log(video_id: str, path: str, nbytes: int, ok: bool):
+    """프록시를 경유한 요청마다 한 줄 계측. 다음에 프록시 GB가 또 터지면 원인(어느 경로/얼마나) 추적용."""
+    print(f"[proxy-degrade] {video_id} / {path} / {nbytes}B / {'ok' if ok else 'fail'}", flush=True)
+
+
+def _degrade_fetch_sync(video_id: str, lang: str, auto: bool, translate: bool) -> dict:
+    """pause 중 프록시 경유 자막 페치(항상 full result 반환 = segments 포함, 상위에서 정형).
+    성공 결과는 캐시에 저장해 이후(직결 회복 후 포함) 재요청 시 YouTube를 안 때리게 한다."""
+    proxy = _pick_proxy()
+    path = "tapi:translate" if translate else "tapi"
+    nbytes, ok = 0, False
+    try:
+        if translate:
+            result = _translate_via_transcript_api(video_id, lang, proxy=proxy)
+            _subtitle_cache_put(video_id, f"t:{lang}", auto, result)
+        else:
+            result = _fetch_via_transcript_api(video_id, lang, auto, proxy=proxy)
+            _subtitle_cache_put(video_id, lang, auto, result)
+        nbytes = len(result.get("subtitles", "").encode("utf-8"))
+        ok = True
+        return result
+    except HTTPException:
+        # 422(자막 없음) 등 의미 있는 상태는 그대로 전파(yt-dlp 폴백 안 함).
+        raise
+    except Exception as e:
+        # transcript-api 실패(쓰로틀/네트워크/파싱) → 무거운 yt-dlp를 프록시로 태우지 않고 retryable 503.
+        raise HTTPException(
+            status_code=503,
+            detail=f"프록시 degrade 자막 페치 실패(직결 회복 후 재시도): {type(e).__name__}",
+            headers={"Retry-After": str(PROXY_DEGRADE_RETRY_AFTER)},
+        )
+    finally:
+        _proxy_degrade_log(video_id, path, nbytes, ok)
+
+
+def _degrade_languages_sync(video_id: str) -> dict:
+    """pause 중 프록시 경유 언어목록 조회. 실패 시 yt-dlp /info 폴백 없이 retryable 503."""
+    proxy = _pick_proxy()
+    ok = False
+    try:
+        result = _fetch_languages_sync(video_id, proxy=proxy)
+        ok = True
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"프록시 degrade 언어조회 실패(직결 회복 후 재시도): {type(e).__name__}",
+            headers={"Retry-After": str(PROXY_DEGRADE_RETRY_AFTER)},
+        )
+    finally:
+        _proxy_degrade_log(video_id, "languages", 0, ok)
+
+
 # 동시 동일요청 합치기(in-flight coalescing): 같은 (video_id, cache_lang, auto)를 여러 요청이
 # 동시에 캐시 미스하면 한 번만 실제로 페치하고 나머지는 그 결과를 공유한다. 다유저가 같은 새 영상을
 # 동시에 열 때 YouTube 중복 호출/버스트를 없애 IP throttle을 줄이는 핵심 장치.
@@ -789,7 +1003,15 @@ def _shape_result(result: dict, include_segments: bool) -> dict:
 
 
 async def _run_fetch(video_id: str, lang: str, auto: bool, priority: int, translate: bool, loop) -> dict:
-    """실제 페치(항상 segments 포함으로 받아 캐시·공유용 full result 반환). 번역/빠른/yt-dlp 경로 선택."""
+    """실제 페치(항상 segments 포함으로 받아 캐시·공유용 full result 반환). 번역/빠른/yt-dlp 경로 선택.
+    (여기 도달했다는 건 캐시 미스라는 뜻 — 캐시 히트는 상위 fetch_subtitles에서 pause와 무관하게 이미 응답됨.)"""
+    # ── pause(직결 IP 밴) 중: 프록시 풀이 있으면 프록시 경유 경량 degrade, 없으면 503(_guard_paused).
+    #    직결 프로브 2회 성공 시 자동 회복되므로, 회복되면 이 분기를 빠져 자연히 직결 경로로 복귀한다.
+    if _pause_remaining() > 0:
+        if not _PROXY_POOL:
+            _guard_paused()  # 풀 없음 → 기존처럼 503(Retry-After)
+        return await loop.run_in_executor(fast_executor, _degrade_fetch_sync, video_id, lang, auto, translate)
+
     # ── 번역 경로: transcript-api tlang 단일요청만 사용(원본 트랙이 없는 언어용). yt-dlp 폴백 없음.
     if translate:
         return await loop.run_in_executor(fast_executor, _translate_fetch_sync, video_id, lang, auto, True)
@@ -954,10 +1176,19 @@ def _fetch_channel_videos_sync(channel_url: str, date: str, include_shorts: bool
 
 def _fetch_info_sync(video_id: str) -> dict:
     url = f"https://www.youtube.com/watch?v={video_id}"
-    ydl_opts = {"skip_download": True, "quiet": True, "no_warnings": True, **_yt_retry_opts()}
-    _yt_throttle()
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        ydl_opts = {"skip_download": True, "quiet": True, "no_warnings": True, **_yt_retry_opts()}
+        _yt_throttle()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        if not (_PROXY_POOL and _is_proxy_quota_error(exc)):
+            raise
+        print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(info-endpoint, {video_id}): {exc}", flush=True)
+        ydl_opts = {"skip_download": True, "quiet": True, "no_warnings": True, **_yt_retry_opts(force_direct=True)}
+        _yt_throttle()
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
     return {
         "video_id": video_id,
         "title": info.get("title"),
@@ -970,13 +1201,22 @@ def _fetch_info_sync(video_id: str) -> dict:
     }
 
 
-def _fetch_languages_sync(video_id: str) -> dict:
+def _fetch_languages_sync(video_id: str, proxy: Optional[str] = None) -> dict:
     """사용 가능한 자막 언어 목록만 빠르게 조회한다. yt-dlp /info(영상 통째 probe, 수 초~수십 초)보다
     youtube-transcript-api list()가 훨씬 빠르다(timedtext 목록 1회). translation_targets는 번역
-    가능한 트랙의 translation_languages(자동번역 대상 전체 목록)에서 모은다(리더 언어 메뉴용)."""
-    _tapi_throttle()
-    ytt = _ytt()
-    tlist = ytt.list(video_id)
+    가능한 트랙의 translation_languages(자동번역 대상 전체 목록)에서 모은다(리더 언어 메뉴용).
+    proxy 명시(pause degrade): 그 프록시로 강제 + 경량 페이싱, 직결 폴백 없음."""
+    via_proxy = proxy is not None
+    (_proxy_pace if via_proxy else _tapi_throttle)()
+    ytt = _ytt(proxy=proxy)
+    try:
+        tlist = ytt.list(video_id)
+    except Exception as exc:
+        if via_proxy or not (_PROXY_POOL and _is_proxy_quota_error(exc)):
+            raise
+        print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(transcript-list, {video_id}): {exc}", flush=True)
+        _tapi_throttle()
+        tlist = _ytt(force_direct=True).list(video_id)
     native: list[str] = []
     auto: list[str] = []
     targets: dict[str, bool] = {}
@@ -987,12 +1227,14 @@ def _fetch_languages_sync(video_id: str) -> dict:
                 code = tl.get("language_code") if isinstance(tl, dict) else getattr(tl, "language_code", None)
                 if code:
                     targets[code] = True
-    return {
+    result = {
         "video_id": video_id,
         "available_subtitles": native,
         "available_auto_captions": auto,
         "translation_targets": list(targets.keys()),
     }
+    _language_cache_put(video_id, result)  # 성공 결과 영구 저장(직결/프록시 degrade 공용) → 재조회 시 list() ~345KB 절약
+    return result
 
 
 # ─────────────────────────────────────────────
@@ -1023,7 +1265,8 @@ async def get_subtitles(
     - `lang`: 자막 언어 코드 (기본값: ko)
     - `auto`: 자동 생성 자막 여부 (기본값: true)
     """
-    _guard_paused()
+    # pause(IP 밴) 처리는 fetch_subtitles 내부에서 캐시 확인 이후에 한다 — 캐시 히트는 YouTube를
+    # 안 때리므로 pause 중에도 즉시 응답하고, 캐시 미스일 때만 프록시 degrade/503으로 분기한다.
     try:
         video_id = extract_video_id(body.url)
     except ValueError as e:
@@ -1111,13 +1354,23 @@ async def get_languages(
 ):
     """사용 가능한 자막 언어 목록만 빠르게 조회(transcript-api). 실패 시 yt-dlp /info로 폴백.
     리더의 언어 전환 드롭다운이 즉답 받도록 만든 경량 엔드포인트."""
-    _guard_paused()
     try:
         video_id = extract_video_id(body.url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # 언어목록 캐시 적중은 YouTube를 안 때리므로 스로틀/예산/pause를 모두 건너뛰고 즉시 응답한다.
+    cached = _language_cache_get(video_id)
+    if cached is not None:
+        return cached
+
     loop = asyncio.get_event_loop()
+    # pause(직결 IP 밴) 중: 프록시 풀이 있으면 프록시 경유 경량 조회(yt-dlp /info 폴백 없음), 없으면 503.
+    if _pause_remaining() > 0:
+        if not _PROXY_POOL:
+            _guard_paused()
+        return await loop.run_in_executor(fast_executor, _degrade_languages_sync, video_id)
+
     try:
         return await loop.run_in_executor(fast_executor, _fetch_languages_sync, video_id)
     except HTTPException:
@@ -1130,6 +1383,7 @@ async def get_languages(
             raise _map_download_error(e)
         # /info엔 translation_targets가 없으니 auto 목록을 대체로 쓴다(yt-dlp auto엔 자동번역 대상이 포함됨).
         result["translation_targets"] = result.get("available_auto_captions", [])
+        _language_cache_put(video_id, result)  # /info 폴백 결과도 캐시(다음 조회는 즉답)
         return result
 
 

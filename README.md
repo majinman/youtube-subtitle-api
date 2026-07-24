@@ -25,6 +25,17 @@ uvicorn main:app --reload --port 8000
 #   ~/.openclaw/workspace-claude-agent/bgutil-pot-provider/server 에서 node build/main.js (:4416)
 ```
 
+## 프록시 운용
+
+- 기본값은 프록시 OFF(집 IP 직결)입니다.
+- `proxies.txt`(또는 `PROXY_LIST`)는 항상 로드되지만 평상시엔 사용하지 않습니다.
+- **IP 밴(pause) 중에만 자동 degrade**: `youtube_pause_until`이 활성일 때 503 대신 프록시 경유 경량 경로(transcript-api만, yt-dlp 폴백 없음, 1s 페이싱)로 요청을 살립니다. 회복 프로브가 직결 성공을 확인하면 자동으로 직결 복귀합니다.
+- 캐시 히트는 pause 중에도 즉시 응답합니다(YouTube를 안 때리므로).
+- `USE_PROXY_POOL=1`은 "항상 프록시" 강제 오버라이드입니다. 이때도 yt-dlp는 재시도 1회 + 쿠키 제외로 경량 운용됩니다(재시도 5회 × 프록시 조합이 과거 1GB 소진의 주범).
+- 프록시 quota/결제 문제(`402 Payment Required`, tunnel proxy 실패) 시 해당 요청은 메인 직결로 한 번 재시도합니다.
+- 프록시 경유 요청은 `[proxy-degrade] video_id/경로/바이트/성공여부` 로그로 계측됩니다.
+- 트래픽 실측·최적화 이력은 `THROTTLE-LEARNINGS.md` 참고 (영상당 바이트의 정체는 watch/player HTML, 2026-07-24 yt-dlp 경로 50% 절감 + /languages 영구 캐시).
+
 ## API 엔드포인트
 
 ### `GET /subtitles` — 자막 추출
