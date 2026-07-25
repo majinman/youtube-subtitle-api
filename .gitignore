@@ -4,6 +4,8 @@ cookies.txt.disabled
 
 # 영구 자막 캐시(수백 MB, 로컬 전용)
 subtitle_cache.db
+youtube_pause_until
+youtube_pause_until.tmp
 
 # 파이썬 빌드 아티팩트
 __pycache__/

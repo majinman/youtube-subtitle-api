@@ -33,9 +33,9 @@ app = FastAPI(
 # ─────────────────────────────────────────────
 # 동시 처리 설정
 # ─────────────────────────────────────────────
-# 모든 yt-dlp 호출을 단일 직렬 큐로 통과시킨다(동시성 1). 여러 소비자(ReadNThink·tubeletter·guru)가
-# 같은 IP로 동시에 때려 429나는 것을 막는 핵심 장치 — 이 게이트웨이가 유일한 yt-dlp 실행 통로다.
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "1"))   # 동시 yt-dlp 처리 수(직렬화로 rate-limit 방지)
+# yt-dlp는 blocking 작업이라 별도 worker pool에서 실행한다. 실제 YouTube upstream 동시성/분당 예산은
+# 아래 UpstreamScheduler가 yt-dlp와 transcript-api를 합쳐 강제한다.
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "1"))
 executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
 
 # transcript-api(빠른 경로) 전용 풀. yt-dlp 스로틀 게이트/큐와 완전히 분리해, 빠른 경로가
@@ -43,64 +43,19 @@ executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT)
 FAST_CONCURRENT = int(os.environ.get("FAST_CONCURRENT", "4"))
 fast_executor = ThreadPoolExecutor(max_workers=FAST_CONCURRENT)
 
-
-class PriorityGate:
-    """동시성 MAX_CONCURRENT의 우선순위 게이트. 대기 중인 요청을 priority 높은 순으로 깨운다(같으면 FIFO).
-    throttle 상황에서 ReadNThink(priority↑) 요청이 tubeletter/importer보다 먼저 처리되게 한다."""
-    def __init__(self, capacity: int = 1):
-        self._capacity = capacity
-        self._active = 0
-        self._waiters: list = []  # heap: (-priority, seq, future)
-        self._counter = itertools.count()
-        self._lock = asyncio.Lock()
-
-    async def acquire(self, priority: int = 0):
-        async with self._lock:
-            if self._active < self._capacity:
-                self._active += 1
-                return
-            fut = asyncio.get_event_loop().create_future()
-            heapq.heappush(self._waiters, (-priority, next(self._counter), fut))
-        await fut  # 슬롯이 인계될 때까지 대기(락 밖)
-
-    async def release(self):
-        async with self._lock:
-            if self._waiters:
-                _, _, fut = heapq.heappop(self._waiters)  # 우선순위 높은 대기자에게 슬롯 인계
-                if not fut.done():
-                    fut.set_result(None)
-            else:
-                self._active -= 1
-
-
-gate = PriorityGate(MAX_CONCURRENT)
-
 # ─────────────────────────────────────────────
-# YouTube rate-limit(429) 회피: yt-dlp가 YouTube를 때리기 직전 전역적으로 요청을 페이싱한다.
-#  - YT_MIN_INTERVAL: 연속 yt-dlp 요청 사이 최소 간격(초). IP 단위 throttle 방지.
-#  - YT_COOLDOWN_AFTER_429: 429를 맞으면 이 시간(초)만큼 모든 호출을 멈춰 회복시킨다.
+# YouTube rate-limit(429) 회피: yt-dlp 429를 감지하면 warm 소비자가 잠시 홀드하도록 쿨다운을 기록한다.
+# 실제 upstream admission은 아래 UpstreamScheduler가 담당한다.
 # ─────────────────────────────────────────────
-YT_MIN_INTERVAL = float(os.environ.get("YT_MIN_INTERVAL", "12.0"))
-# android 클라이언트 스푸핑으로 429가 드물어졌으므로, 한 번 맞아도 전체를 오래 freeze하지
-# 않도록 쿨다운을 짧게 둔다(라이브 영상 등 불가피한 429가 정상 요청을 굶기지 않게).
 YT_COOLDOWN_AFTER_429 = float(os.environ.get("YT_COOLDOWN_AFTER_429", "30"))
 
 _yt_throttle_lock = threading.Lock()
-_yt_last_call = 0.0
 _yt_cooldown_until = 0.0
 
 
-def _yt_throttle():
-    """yt-dlp의 YouTube 요청 직전 호출. 전역 처리 예산 → 최소 간격 → 429 쿨다운을 차례로 강제한다.
-    락을 잡은 채 대기하므로 동시 요청도 자연히 직렬화되어 IP throttle을 피한다."""
-    _yt_budget_acquire()  # 전역 처리 예산(하드 캡) 먼저 소비
-    global _yt_last_call
-    with _yt_throttle_lock:
-        now = time.monotonic()
-        wait = max(_yt_cooldown_until - now, _yt_last_call + YT_MIN_INTERVAL - now)
-        if wait > 0:
-            time.sleep(wait + random.uniform(0, 0.5))  # 지터로 정확한 간격 충돌 방지
-        _yt_last_call = time.monotonic()
+def _yt_throttle(path: str = "yt-dlp", video_id: str | None = None, priority: int = 0, traffic_class: str = "foreground"):
+    """Compatibility wrapper: all yt-dlp upstream hits now pass through the central scheduler."""
+    return _UPSTREAM_SCHEDULER.admit("direct", traffic_class, priority, path, video_id)
 
 
 def _yt_mark_429():
@@ -110,27 +65,15 @@ def _yt_mark_429():
         _yt_cooldown_until = time.monotonic() + YT_COOLDOWN_AFTER_429
 
 
-# transcript-api(빠른 경로/번역/언어목록) 전용 경량 페이싱. yt-dlp와 별개 통로지만 같은 IP로
-# YouTube timedtext를 때리므로, 무방비로 두면 연타(다언어 번역·다유저 동시)로 IP throttle에 걸린다.
-# yt-dlp의 12s보다 짧은 최소 간격으로 버스트만 눌러 지연을 최소화한다(+실패 시 쿨다운).
-TAPI_MIN_INTERVAL = float(os.environ.get("TAPI_MIN_INTERVAL", "2.5"))
+# transcript-api(빠른 경로/번역/언어목록)도 같은 집 IP로 YouTube timedtext를 때리므로 direct lane에 합산한다.
 TAPI_COOLDOWN_AFTER_FAIL = float(os.environ.get("TAPI_COOLDOWN_AFTER_FAIL", "20"))
 _tapi_throttle_lock = threading.Lock()
-_tapi_last_call = 0.0
 _tapi_cooldown_until = 0.0
 
 
-def _tapi_throttle():
-    """transcript-api가 YouTube를 때리기 직전 호출. 전역 처리 예산 → 최소 간격 + 실패 쿨다운을 강제한다.
-    락을 잡은 채 대기하므로 동시 요청도 자연히 직렬화된다."""
-    _yt_budget_acquire()  # 전역 처리 예산(하드 캡) 먼저 소비 — yt-dlp 경로와 공유
-    global _tapi_last_call
-    with _tapi_throttle_lock:
-        now = time.monotonic()
-        wait = max(_tapi_cooldown_until - now, _tapi_last_call + TAPI_MIN_INTERVAL - now)
-        if wait > 0:
-            time.sleep(wait + random.uniform(0, 0.3))
-        _tapi_last_call = time.monotonic()
+def _tapi_throttle(path: str = "transcript-api", video_id: str | None = None, priority: int = 0, traffic_class: str = "foreground"):
+    """Compatibility wrapper: transcript-api hits share the same direct scheduler as yt-dlp."""
+    return _UPSTREAM_SCHEDULER.admit("direct", traffic_class, priority, path, video_id)
 
 
 def _tapi_mark_fail():
@@ -140,69 +83,32 @@ def _tapi_mark_fail():
         _tapi_cooldown_until = time.monotonic() + TAPI_COOLDOWN_AFTER_FAIL
 
 
-# ── 프록시 degrade 전용 경량 페이싱: pause(직결 IP 밴) 중 프록시 경유 요청은 egress가 집 IP가
-#    아니므로, 집 IP 보호용 전역 예산(_yt_budget_acquire)·직결 스로틀(_tapi_throttle)을 소모하면 안 된다.
-#    대신 프록시 서버 보호용 최소 간격만 둔다(버스트만 억제). ──
-PROXY_MIN_INTERVAL = float(os.environ.get("PROXY_MIN_INTERVAL", "1.0"))
-_proxy_pace_lock = threading.Lock()
-_proxy_last_call = 0.0
+# ── 프록시 degrade/overflow 전용 admission wrapper. proxy lane은 direct lane과 별도 예산을 쓰지만,
+#    foreground만 허용하고 hourly cap으로 비용을 제한한다. ──
 
 
-def _proxy_pace():
-    """프록시 경유 호출 직전 최소 간격만 강제(전역 예산·직결 스로틀 미소모)."""
-    global _proxy_last_call
-    with _proxy_pace_lock:
-        now = time.monotonic()
-        wait = _proxy_last_call + PROXY_MIN_INTERVAL - now
-        if wait > 0:
-            time.sleep(wait)
-        _proxy_last_call = time.monotonic()
+def _proxy_pace(path: str = "proxy", video_id: str | None = None, priority: int = 0, traffic_class: str = "foreground"):
+    """Compatibility wrapper: proxy hits use the central paid-overflow budget."""
+    return _UPSTREAM_SCHEDULER.admit("proxy", traffic_class, priority, path, video_id)
 
 
-# ─────────────────────────────────────────────
-# 전역 YouTube 처리 예산(하드 캡, 토큰버킷): yt-dlp·transcript-api 두 경로를 "합쳐서" 분당 최대
-# YT_BUDGET_PER_MIN회만 실제로 YouTube를 때리게 한다. 요청은 무제한 받되 실제 처리 rate를 이 예산이
-# 강제하므로, 아무리 몰려도 버스트가 안 생겨 IP throttle을 원천 차단한다.
-#  - 토큰이 있으면 즉시 소비하고 진행.
-#  - 없으면 리필될 때까지 대기하되, 대기가 YT_BUDGET_MAX_WAIT를 넘으면 503(Retry-After)로 넘겨
-#    소비자(RT 워커)가 나중에 재시도하게 한다(문서 PENDING 유지 → 유실 없음).
-#  - 캐시 적중·번역 등은 스로틀 지점을 안 거치므로 예산을 소모하지 않는다.
-# ─────────────────────────────────────────────
-YT_BUDGET_PER_MIN = float(os.environ.get("YT_BUDGET_PER_MIN", "60"))   # 분당 실제 YouTube 히트 상한
-YT_BUDGET_BURST = float(os.environ.get("YT_BUDGET_BURST", "10"))       # 순간 허용 버스트(토큰 최대치)
-YT_BUDGET_MAX_WAIT = float(os.environ.get("YT_BUDGET_MAX_WAIT", "30")) # 이보다 오래 기다려야 하면 503
+# ── 직결 IP 일시정지/프록시 failover 상태.
+#    youtube_pause_until 파일에 epoch(초)를 적으면 그 시각까지 직결 YouTube egress를 멈춘다.
+#    프록시 풀이 있으면 캐시 미스 요청만 경량 proxy-degrade 경로로 처리하고, 없으면 503을 반환한다.
+#    자동 failover는 credible direct-path block(IpBlocked/429)이 짧은 윈도우에서 반복될 때만 켜며,
+#    파일의 만료시각과 회복 프로브가 모두 프록시를 영구 기본 경로로 만드는 것을 막는다.
+PAUSE_FILE = os.environ.get(
+    "YOUTUBE_PAUSE_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "youtube_pause_until"),
+)
+AUTO_PROXY_FAILOVER = os.environ.get("AUTO_PROXY_FAILOVER", "1").strip().lower() not in {"0", "false", "no", "off"}
+DIRECT_BLOCK_THRESHOLD = int(os.environ.get("DIRECT_BLOCK_THRESHOLD", "2"))
+DIRECT_BLOCK_WINDOW = float(os.environ.get("DIRECT_BLOCK_WINDOW", "300"))
+AUTO_PROXY_PAUSE_SECONDS = float(os.environ.get("AUTO_PROXY_PAUSE_SECONDS", "1800"))
+AUTO_PROXY_MAX_PAUSE_SECONDS = float(os.environ.get("AUTO_PROXY_MAX_PAUSE_SECONDS", "7200"))
 
-_budget_lock = threading.Lock()
-_budget_tat = time.monotonic()  # GCRA theoretical arrival time(다음 토큰이 나는 가상 시각)
-print(f"[budget] YouTube 처리 예산: 분당 {YT_BUDGET_PER_MIN:.0f}회, 버스트 {YT_BUDGET_BURST:.0f}, 최대대기 {YT_BUDGET_MAX_WAIT:.0f}s(초과분 503)", flush=True)
-
-
-def _yt_budget_acquire():
-    """실제 YouTube 히트 직전 호출 — 전역 rate를 GCRA로 강제한다(두 경로 공유).
-    정상 분당 YT_BUDGET_PER_MIN회, 순간 버스트 YT_BUDGET_BURST개까지 허용. 예약 대기가
-    YT_BUDGET_MAX_WAIT 이내면 그만큼(락 밖에서) 대기 후 진행하고, 넘으면 HTTPException(503)."""
-    global _budget_tat
-    interval = 60.0 / YT_BUDGET_PER_MIN                    # 토큰당 방출 간격
-    burst_tol = max(0.0, YT_BUDGET_BURST - 1.0) * interval  # 버스트 허용폭
-    with _budget_lock:
-        now = time.monotonic()
-        tat = max(_budget_tat, now)
-        wait = (tat - burst_tol) - now
-        if wait > YT_BUDGET_MAX_WAIT:
-            raise HTTPException(
-                status_code=503,
-                detail=f"처리 예산 소진(분당 {YT_BUDGET_PER_MIN:.0f}회 제한). {int(wait) + 1}s 후 재시도.",
-                headers={"Retry-After": str(int(wait) + 1)},
-            )
-        _budget_tat = tat + interval  # 슬롯 예약(동시 폭주 시 예약이 쌓여 뒤 요청은 503)
-    if wait > 0:
-        time.sleep(wait)  # 락 밖에서 대기 → 다른 요청은 즉시 자기 예약을 계산(정확한 큐잉)
-
-
-# ── 수동 일시정지(IP 쿨다운): youtube_pause_until 파일에 epoch(초)를 적으면 그 시각까지
-#    자막/언어 조회를 즉시 503으로 막아 YouTube egress를 0으로 만든다. 파일 기반이라
-#    재시작 없이 설정/해제되고, 시각이 지나면 자동 재개된다. (소비자는 503을 retryable로 처리)
-PAUSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "youtube_pause_until")
+_pause_lock = threading.Lock()
+_direct_block_events: collections.deque = collections.deque()
 
 
 def _pause_remaining() -> float:
@@ -212,6 +118,64 @@ def _pause_remaining() -> float:
     except (FileNotFoundError, ValueError):
         return 0.0
     return max(0.0, until - time.time())
+
+
+def _set_pause(seconds: float, reason: str, video_id: str | None = None) -> float:
+    bounded_seconds = max(1.0, min(float(seconds), AUTO_PROXY_MAX_PAUSE_SECONDS))
+    until = time.time() + bounded_seconds
+    with _pause_lock:
+        current_remaining = _pause_remaining()
+        current_until = time.time() + current_remaining if current_remaining > 0 else 0.0
+        if current_until > until:
+            until = current_until
+        tmp = f"{PAUSE_FILE}.tmp"
+        with open(tmp, "w") as f:
+            f.write(str(until))
+        os.replace(tmp, PAUSE_FILE)
+    print(
+        f"[proxy-failover] pause active reason={reason} video={video_id or '-'} "
+        f"until={int(until)} remaining={int(max(0, until - time.time()))}s "
+        f"proxy_pool={len(_PROXY_POOL)}",
+        flush=True,
+    )
+    return until
+
+
+def _is_direct_block_error(exc: Exception) -> bool:
+    message = str(exc)
+    name = type(exc).__name__
+    return (
+        name == "IpBlocked"
+        or "IpBlocked" in message
+        or "HTTP Error 429" in message
+        or "Too Many Requests" in message
+        or "blocking requests from your IP" in message
+        or "IP blocked" in message
+    )
+
+
+def _note_direct_block(video_id: str | None, path: str, exc: Exception) -> None:
+    if not AUTO_PROXY_FAILOVER or not _PROXY_POOL or _proxy_forced():
+        return
+    if not _is_direct_block_error(exc):
+        return
+
+    now = time.time()
+    with _pause_lock:
+        _direct_block_events.append(now)
+        cutoff = now - DIRECT_BLOCK_WINDOW
+        while _direct_block_events and _direct_block_events[0] < cutoff:
+            _direct_block_events.popleft()
+        count = len(_direct_block_events)
+
+    print(
+        f"[proxy-failover] direct block observed path={path} video={video_id or '-'} "
+        f"type={type(exc).__name__} count={count}/{DIRECT_BLOCK_THRESHOLD}",
+        flush=True,
+    )
+    _UPSTREAM_SCHEDULER.note_direct_block()
+    if count >= DIRECT_BLOCK_THRESHOLD:
+        _set_pause(AUTO_PROXY_PAUSE_SECONDS, f"direct-{path}-blocked", video_id)
 
 
 def _guard_paused():
@@ -273,6 +237,12 @@ elif _PROXY_POOL:
     print(f"[proxy] 프록시 풀 {len(_PROXY_POOL)}개 로드 — 기본 직결, pause(IP 밴) 중에만 프록시 degrade", flush=True)
 else:
     print("[proxy] 프록시 풀 없음 — 기본 직결, pause 중엔 503", flush=True)
+print(
+    f"[proxy-failover] auto={'on' if AUTO_PROXY_FAILOVER else 'off'} "
+    f"threshold={DIRECT_BLOCK_THRESHOLD}/{int(DIRECT_BLOCK_WINDOW)}s "
+    f"pause={int(AUTO_PROXY_PAUSE_SECONDS)}s max={int(AUTO_PROXY_MAX_PAUSE_SECONDS)}s",
+    flush=True,
+)
 
 
 def _proxy_forced() -> bool:
@@ -293,6 +263,216 @@ def _is_proxy_quota_error(exc: Exception) -> bool:
         or "Tunnel connection failed: 402" in message
         or "Unable to connect to proxy" in message
     )
+
+
+UPSTREAM_DIRECT_CONCURRENCY = int(os.environ.get("UPSTREAM_DIRECT_CONCURRENCY", "1"))
+UPSTREAM_DIRECT_RPM = float(os.environ.get("UPSTREAM_DIRECT_RPM", "8"))
+UPSTREAM_DIRECT_BURST = float(os.environ.get("UPSTREAM_DIRECT_BURST", "2"))
+UPSTREAM_DIRECT_MAX_WAIT = float(os.environ.get("UPSTREAM_DIRECT_MAX_WAIT", "45"))
+UPSTREAM_WARM_MAX_WAIT = float(os.environ.get("UPSTREAM_WARM_MAX_WAIT", "2"))
+UPSTREAM_PROXY_CONCURRENCY = int(os.environ.get("UPSTREAM_PROXY_CONCURRENCY", "1"))
+UPSTREAM_PROXY_RPM = float(os.environ.get("UPSTREAM_PROXY_RPM", "12"))
+UPSTREAM_PROXY_BURST = float(os.environ.get("UPSTREAM_PROXY_BURST", "2"))
+UPSTREAM_PROXY_MAX_WAIT = float(os.environ.get("UPSTREAM_PROXY_MAX_WAIT", "15"))
+UPSTREAM_PROXY_HOURLY_CAP = int(os.environ.get("UPSTREAM_PROXY_HOURLY_CAP", "120"))
+UPSTREAM_PROXY_OVERFLOW_QUEUE = int(os.environ.get("UPSTREAM_PROXY_OVERFLOW_QUEUE", "1"))
+
+
+class UpstreamAdmission:
+    def __init__(self, scheduler: "UpstreamScheduler", lane: str):
+        self.scheduler = scheduler
+        self.lane = lane
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.scheduler.release(self.lane)
+        return False
+
+
+class UpstreamScheduler:
+    """Single process-wide admission controller for every YouTube upstream hit."""
+
+    def __init__(self):
+        self._lock = threading.Condition()
+        self._seq = itertools.count()
+        self._queues = {"direct": [], "proxy": []}
+        self._active = {"direct": 0, "proxy": 0}
+        self._tat = {"direct": time.monotonic(), "proxy": time.monotonic()}
+        self._proxy_window_start = time.time()
+        self._proxy_window_count = 0
+        self._metrics = collections.Counter()
+
+    def _cfg(self, lane: str) -> dict:
+        if lane == "proxy":
+            return {
+                "concurrency": max(0, UPSTREAM_PROXY_CONCURRENCY),
+                "rpm": max(0.1, UPSTREAM_PROXY_RPM),
+                "burst": max(1.0, UPSTREAM_PROXY_BURST),
+                "max_wait": max(0.0, UPSTREAM_PROXY_MAX_WAIT),
+            }
+        return {
+            "concurrency": max(1, UPSTREAM_DIRECT_CONCURRENCY),
+            "rpm": max(0.1, UPSTREAM_DIRECT_RPM),
+            "burst": max(1.0, UPSTREAM_DIRECT_BURST),
+            "max_wait": max(0.0, UPSTREAM_DIRECT_MAX_WAIT),
+        }
+
+    def _traffic_max_wait(self, lane: str, traffic_class: str) -> float:
+        if traffic_class == "warm":
+            return UPSTREAM_WARM_MAX_WAIT
+        return self._cfg(lane)["max_wait"]
+
+    def _budget_wait_locked(self, lane: str, now: float) -> float:
+        cfg = self._cfg(lane)
+        interval = 60.0 / cfg["rpm"]
+        burst_tol = max(0.0, cfg["burst"] - 1.0) * interval
+        return max(0.0, (max(self._tat[lane], now) - burst_tol) - now)
+
+    def _reserve_budget_locked(self, lane: str, now: float) -> None:
+        cfg = self._cfg(lane)
+        interval = 60.0 / cfg["rpm"]
+        self._tat[lane] = max(self._tat[lane], now) + interval
+
+    def _proxy_cap_available_locked(self) -> bool:
+        now = time.time()
+        if now - self._proxy_window_start >= 3600:
+            self._proxy_window_start = now
+            self._proxy_window_count = 0
+        return self._proxy_window_count < UPSTREAM_PROXY_HOURLY_CAP
+
+    def _record_proxy_use_locked(self) -> None:
+        now = time.time()
+        if now - self._proxy_window_start >= 3600:
+            self._proxy_window_start = now
+            self._proxy_window_count = 0
+        self._proxy_window_count += 1
+
+    def proxy_overflow_available(self, traffic_class: str = "foreground") -> bool:
+        if traffic_class != "foreground" or not _PROXY_POOL or _proxy_forced():
+            return False
+        with self._lock:
+            if not self._proxy_cap_available_locked():
+                return False
+            direct_pressure = self._active["direct"] + len(self._queues["direct"])
+            return _pause_remaining() > 0 or direct_pressure >= UPSTREAM_PROXY_OVERFLOW_QUEUE
+
+    def admit(self, lane: str, traffic_class: str, priority: int, path: str, video_id: str | None = None) -> UpstreamAdmission:
+        if lane == "proxy":
+            if traffic_class != "foreground":
+                self._metrics["proxy_denied_ineligible"] += 1
+                raise HTTPException(status_code=503, detail="proxy overflow is disabled for background traffic", headers={"Retry-After": "60"})
+            if not _PROXY_POOL:
+                self._metrics["proxy_denied_no_pool"] += 1
+                raise HTTPException(status_code=503, detail="proxy overflow unavailable", headers={"Retry-After": "60"})
+        if lane == "direct" and traffic_class == "warm" and _pause_remaining() > 0:
+            self._metrics["warm_deferred_pause"] += 1
+            _guard_paused()
+
+        cfg = self._cfg(lane)
+        max_wait = self._traffic_max_wait(lane, traffic_class)
+        deadline = time.monotonic() + max_wait
+        ticket = (-priority, next(self._seq), traffic_class, path, video_id)
+        with self._lock:
+            if cfg["concurrency"] <= 0:
+                self._metrics[f"{lane}_denied_disabled"] += 1
+                raise HTTPException(status_code=503, detail=f"{lane} lane disabled", headers={"Retry-After": "60"})
+            if lane == "proxy" and not self._proxy_cap_available_locked():
+                self._metrics["proxy_denied_hourly_cap"] += 1
+                raise HTTPException(status_code=503, detail="proxy hourly budget exhausted", headers={"Retry-After": "300"})
+            heapq.heappush(self._queues[lane], ticket)
+            self._metrics[f"{lane}_queued_total"] += 1
+            print(
+                f"[upstream] queued lane={lane} traffic={traffic_class} priority={priority} "
+                f"path={path} video={video_id or '-'} q={len(self._queues[lane])}",
+                flush=True,
+            )
+            while True:
+                now = time.monotonic()
+                remaining = deadline - now
+                is_turn = self._queues[lane] and self._queues[lane][0] == ticket
+                budget_wait = self._budget_wait_locked(lane, now)
+                if is_turn and self._active[lane] < cfg["concurrency"] and budget_wait <= 0:
+                    heapq.heappop(self._queues[lane])
+                    self._active[lane] += 1
+                    self._reserve_budget_locked(lane, now)
+                    if lane == "proxy":
+                        self._record_proxy_use_locked()
+                    self._metrics[f"{lane}_admitted_total"] += 1
+                    self._metrics[f"{lane}_{traffic_class}_admitted_total"] += 1
+                    print(
+                        f"[upstream] admit lane={lane} traffic={traffic_class} path={path} "
+                        f"video={video_id or '-'} active={self._active[lane]} q={len(self._queues[lane])}",
+                        flush=True,
+                    )
+                    return UpstreamAdmission(self, lane)
+                if remaining <= 0:
+                    try:
+                        self._queues[lane].remove(ticket)
+                        heapq.heapify(self._queues[lane])
+                    except ValueError:
+                        pass
+                    self._metrics[f"{lane}_denied_wait_total"] += 1
+                    self._metrics[f"{lane}_{traffic_class}_denied_wait_total"] += 1
+                    retry_after = str(max(1, int(max(budget_wait, 1))))
+                    print(
+                        f"[upstream] deny lane={lane} traffic={traffic_class} path={path} "
+                        f"video={video_id or '-'} reason=wait_timeout q={len(self._queues[lane])}",
+                        flush=True,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"{lane} upstream capacity saturated; retry later",
+                        headers={"Retry-After": retry_after},
+                    )
+                wait = min(max(0.01, budget_wait if is_turn else 0.25), max(0.01, remaining))
+                self._lock.wait(timeout=wait)
+
+    def release(self, lane: str) -> None:
+        with self._lock:
+            self._active[lane] = max(0, self._active[lane] - 1)
+            self._lock.notify_all()
+
+    def note_direct_block(self) -> None:
+        with self._lock:
+            self._metrics["direct_block_events_total"] += 1
+
+    def note_recovery(self) -> None:
+        with self._lock:
+            self._metrics["direct_recoveries_total"] += 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            proxy_remaining = max(0, UPSTREAM_PROXY_HOURLY_CAP - self._proxy_window_count)
+            return {
+                "direct": {
+                    "active": self._active["direct"],
+                    "queued": len(self._queues["direct"]),
+                    "concurrency": UPSTREAM_DIRECT_CONCURRENCY,
+                    "rpm": UPSTREAM_DIRECT_RPM,
+                    "burst": UPSTREAM_DIRECT_BURST,
+                },
+                "proxy": {
+                    "active": self._active["proxy"],
+                    "queued": len(self._queues["proxy"]),
+                    "concurrency": UPSTREAM_PROXY_CONCURRENCY,
+                    "rpm": UPSTREAM_PROXY_RPM,
+                    "burst": UPSTREAM_PROXY_BURST,
+                    "hourly_cap": UPSTREAM_PROXY_HOURLY_CAP,
+                    "hourly_remaining": proxy_remaining,
+                },
+                "metrics": dict(self._metrics),
+            }
+
+
+_UPSTREAM_SCHEDULER = UpstreamScheduler()
+print(
+    f"[upstream] scheduler direct={UPSTREAM_DIRECT_CONCURRENCY}c/{UPSTREAM_DIRECT_RPM:.1f}rpm "
+    f"burst={UPSTREAM_DIRECT_BURST:.0f} proxy={UPSTREAM_PROXY_CONCURRENCY}c/{UPSTREAM_PROXY_RPM:.1f}rpm "
+    f"proxy_hourly_cap={UPSTREAM_PROXY_HOURLY_CAP}",
+    flush=True,
+)
 
 
 def _yt_retry_opts(force_direct: bool = False) -> dict:
@@ -331,7 +511,7 @@ def _ytt(force_direct: bool = False, proxy: Optional[str] = None) -> YouTubeTran
 WARM_MIN_INTERVAL = float(os.environ.get("WARM_MIN_INTERVAL", "20"))   # warm 요청 간 최소 간격(초)
 WARM_QUEUE_MAX = int(os.environ.get("WARM_QUEUE_MAX", "500"))          # 큐 상한(초과 시 오래된 것부터 drop)
 WARM_MAX_PER_CALL = int(os.environ.get("WARM_MAX_PER_CALL", "50"))     # /warm 1회 최대 video_id 수(초과분 무시)
-WARM_PRIORITY = int(os.environ.get("WARM_PRIORITY", "-1"))            # PriorityGate 우선순위(인터랙티브 0보다 낮게)
+WARM_PRIORITY = int(os.environ.get("WARM_PRIORITY", "-1"))            # UpstreamScheduler 우선순위(인터랙티브 0보다 낮게)
 WARM_HOLD_INTERVAL = float(os.environ.get("WARM_HOLD_INTERVAL", "30"))  # pause/429/예산소진 시 큐 홀드 간격(초)
 
 _warm_queue: collections.deque = collections.deque()  # 항목: (video_id, lang)
@@ -551,11 +731,12 @@ def _ensure_usable_subtitles(text: str) -> str:
     return normalized
 
 
-def _map_download_error(exc: Exception) -> HTTPException:
+def _map_download_error(exc: Exception, video_id: str | None = None, path: str = "yt-dlp") -> HTTPException:
     message = str(exc)
 
     if "HTTP Error 429" in message or "Too Many Requests" in message:
         _yt_mark_429()  # 쿨다운 진입 → 후속 호출이 회복 시간 동안 대기
+        _note_direct_block(video_id, path, exc)
         return HTTPException(status_code=429, detail=f"자막 추출이 일시적으로 제한되었습니다: {message}")
 
     if "Private video" in message:
@@ -651,14 +832,21 @@ def _language_cache_put(video_id: str, result: dict):
         _cache_conn.commit()
 
 
-def _fetch_subtitles_sync(video_id: str, lang: str, auto: bool, include_segments: bool = False) -> dict:
+def _fetch_subtitles_sync(
+    video_id: str,
+    lang: str,
+    auto: bool,
+    include_segments: bool = False,
+    priority: int = 0,
+    traffic_class: str = "foreground",
+) -> dict:
     """캐시 우선 래퍼. 성공 결과는 영구 캐시(트랜스크립트는 게시 후 불변)되어 같은 영상 재요청 시
     YouTube를 때리지 않는다 — throttle/429의 실수요 자체를 줄이는 핵심 장치."""
     cached = _subtitle_cache_get(video_id, lang, auto)
     if cached is not None:
         result = dict(cached)
     else:
-        result = _fetch_subtitles_uncached(video_id, lang, auto)
+        result = _fetch_subtitles_uncached(video_id, lang, auto, priority, traffic_class)
         _subtitle_cache_put(video_id, lang, auto, result)
         result = dict(result)
 
@@ -693,7 +881,7 @@ def _pick_caption_url(info: dict, resolved_lang: str, auto: bool) -> Optional[st
     return None
 
 
-def _fetch_subtitles_uncached(video_id: str, lang: str, auto: bool) -> dict:
+def _fetch_subtitles_uncached(video_id: str, lang: str, auto: bool, priority: int = 0, traffic_class: str = "foreground") -> dict:
     """blocking yt-dlp 작업 (ThreadPoolExecutor에서 실행)"""
     url = f"https://www.youtube.com/watch?v={video_id}"
 
@@ -703,20 +891,21 @@ def _fetch_subtitles_uncached(video_id: str, lang: str, auto: bool) -> dict:
     # ydl 인스턴스를 with로 즉시 닫지 않고 유지한다 → 3단계에서 같은 세션(쿠키/헤더/프록시/POT)으로
     # info 안의 timedtext URL을 직접 GET하기 위함(2차 extract_info 제거).
     ydl_opts_info = {"skip_download": True, "quiet": True, "no_warnings": True, "ignore_no_formats_error": True, **_yt_retry_opts()}
-    _yt_throttle()
+    direct_admission = _yt_throttle("yt-dlp-info", video_id, priority, traffic_class)
     ydl = yt_dlp.YoutubeDL(ydl_opts_info)
     try:
-        try:
-            info = ydl.extract_info(url, download=False)
-        except Exception as exc:
-            if not (_PROXY_POOL and _is_proxy_quota_error(exc)):
-                raise
-            print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(info, {video_id}): {exc}", flush=True)
-            ydl.close()
-            ydl_opts_info = {"skip_download": True, "quiet": True, "no_warnings": True, "ignore_no_formats_error": True, **_yt_retry_opts(force_direct=True)}
-            _yt_throttle()
-            ydl = yt_dlp.YoutubeDL(ydl_opts_info)
-            info = ydl.extract_info(url, download=False)
+        with direct_admission:
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception as exc:
+                if not (_PROXY_POOL and _is_proxy_quota_error(exc)):
+                    raise
+                print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(info, {video_id}): {exc}", flush=True)
+                ydl.close()
+                ydl_opts_info = {"skip_download": True, "quiet": True, "no_warnings": True, "ignore_no_formats_error": True, **_yt_retry_opts(force_direct=True)}
+                with _yt_throttle("yt-dlp-info-direct-retry", video_id, priority, traffic_class):
+                    ydl = yt_dlp.YoutubeDL(ydl_opts_info)
+                    info = ydl.extract_info(url, download=False)
 
         title = info.get("title", "")
         channel = info.get("channel", "")
@@ -737,28 +926,28 @@ def _fetch_subtitles_uncached(video_id: str, lang: str, auto: bool) -> dict:
         if not cap_url:
             raise HTTPException(status_code=422, detail="사용 가능한 자막이 없습니다.")
 
-        _yt_throttle()  # 자막 GET도 YouTube 히트 → 기존 3단계와 동일하게 페이싱한다.
-        try:
-            content = ydl.urlopen(cap_url).read().decode("utf-8", "replace")
-        except HTTPException:
-            raise
-        except Exception as exc:
-            if _PROXY_POOL and _is_proxy_quota_error(exc):
-                print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(caption, {video_id}): {exc}", flush=True)
-                ydl.close()
-                ydl = yt_dlp.YoutubeDL({"skip_download": True, "quiet": True, "no_warnings": True, "ignore_no_formats_error": True, **_yt_retry_opts(force_direct=True)})
-                _yt_throttle()
-                try:
-                    content = ydl.urlopen(cap_url).read().decode("utf-8", "replace")
-                except HTTPException:
-                    raise
-                except Exception as exc2:
-                    raise _map_download_error(exc2)  # 429 등 → 적절한 상태코드 매핑 + _yt_mark_429 쿨다운
-            else:
-                # ydl.urlopen은 DownloadError가 아닌 networking HTTPError(429 등)를 던진다.
-                # 예전 extract_info(download=True) 경로가 DownloadError→_map_download_error로 얻던
-                # 429 매핑/쿨다운을 여기서도 동일하게 유지한다(그냥 raise하면 상위에서 500이 됨).
-                raise _map_download_error(exc)
+        with _yt_throttle("yt-dlp-caption", video_id, priority, traffic_class):  # 자막 GET도 YouTube 히트.
+            try:
+                content = ydl.urlopen(cap_url).read().decode("utf-8", "replace")
+            except HTTPException:
+                raise
+            except Exception as exc:
+                if _PROXY_POOL and _is_proxy_quota_error(exc):
+                    print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(caption, {video_id}): {exc}", flush=True)
+                    ydl.close()
+                    ydl = yt_dlp.YoutubeDL({"skip_download": True, "quiet": True, "no_warnings": True, "ignore_no_formats_error": True, **_yt_retry_opts(force_direct=True)})
+                    with _yt_throttle("yt-dlp-caption-direct-retry", video_id, priority, traffic_class):
+                        try:
+                            content = ydl.urlopen(cap_url).read().decode("utf-8", "replace")
+                        except HTTPException:
+                            raise
+                        except Exception as exc2:
+                            raise _map_download_error(exc2, video_id, "yt-dlp-caption")  # 429 등 → 적절한 상태코드 매핑 + _yt_mark_429 쿨다운
+                else:
+                    # ydl.urlopen은 DownloadError가 아닌 networking HTTPError(429 등)를 던진다.
+                    # 예전 extract_info(download=True) 경로가 DownloadError→_map_download_error로 얻던
+                    # 429 매핑/쿨다운을 여기서도 동일하게 유지한다(그냥 raise하면 상위에서 500이 됨).
+                    raise _map_download_error(exc, video_id, "yt-dlp-caption")
     finally:
         ydl.close()
 
@@ -783,7 +972,14 @@ def _fetch_subtitles_uncached(video_id: str, lang: str, auto: bool) -> dict:
     return result
 
 
-def _fetch_via_transcript_api(video_id: str, lang: str, auto: bool, proxy: Optional[str] = None) -> dict:
+def _fetch_via_transcript_api(
+    video_id: str,
+    lang: str,
+    auto: bool,
+    proxy: Optional[str] = None,
+    priority: int = 0,
+    traffic_class: str = "foreground",
+) -> dict:
     """빠른 경로: youtube-transcript-api로 timedtext를 직접 1회 요청해 자막을 받는다
     (yt-dlp의 메타 probe + VTT 다운로드보다 훨씬 빠름). 성공 시 yt-dlp 경로와 동일한 result
     딕셔너리를 돌려주고, 실패(자막 없음/IP 차단/네트워크/너무 짧음)하면 예외를 던져 호출부가
@@ -792,16 +988,16 @@ def _fetch_via_transcript_api(video_id: str, lang: str, auto: bool, proxy: Optio
     proxy 명시(pause degrade): 그 프록시로 강제하고 경량 페이싱만 쓰며, 직결 폴백은 하지 않는다
     (직결 IP가 밴된 상태라 직결 재시도가 무의미)."""
     via_proxy = proxy is not None
-    (_proxy_pace if via_proxy else _tapi_throttle)()
-    ytt = _ytt(proxy=proxy)
-    try:
-        tlist = ytt.list(video_id)
-    except Exception as exc:
-        if via_proxy or not (_PROXY_POOL and _is_proxy_quota_error(exc)):
-            raise
-        print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(transcript-list, {video_id}): {exc}", flush=True)
-        _tapi_throttle()
-        tlist = _ytt(force_direct=True).list(video_id)
+    with (_proxy_pace if via_proxy else _tapi_throttle)("transcript-list", video_id, priority, traffic_class):
+        ytt = _ytt(proxy=proxy)
+        try:
+            tlist = ytt.list(video_id)
+        except Exception as exc:
+            if via_proxy or not (_PROXY_POOL and _is_proxy_quota_error(exc)):
+                raise
+            print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(transcript-list, {video_id}): {exc}", flush=True)
+            with _tapi_throttle("transcript-list-direct-retry", video_id, priority, traffic_class):
+                tlist = _ytt(force_direct=True).list(video_id)
 
     available_subs: list[str] = []
     available_auto: list[str] = []
@@ -840,9 +1036,9 @@ def _fetch_via_transcript_api(video_id: str, lang: str, auto: bool, proxy: Optio
     }
 
 
-def _fast_fetch_sync(video_id: str, lang: str, auto: bool, include_segments: bool) -> dict:
+def _fast_fetch_sync(video_id: str, lang: str, auto: bool, include_segments: bool, priority: int = 0, traffic_class: str = "foreground") -> dict:
     """빠른 경로 실행 + 성공 결과 캐시(yt-dlp 경로와 같은 캐시 공유)."""
-    result = _fetch_via_transcript_api(video_id, lang, auto)
+    result = _fetch_via_transcript_api(video_id, lang, auto, priority=priority, traffic_class=traffic_class)
     _subtitle_cache_put(video_id, lang, auto, result)
     result = dict(result)
     if include_segments:
@@ -852,23 +1048,29 @@ def _fast_fetch_sync(video_id: str, lang: str, auto: bool, include_segments: boo
     return result
 
 
-def _translate_via_transcript_api(video_id: str, target_lang: str, proxy: Optional[str] = None) -> dict:
+def _translate_via_transcript_api(
+    video_id: str,
+    target_lang: str,
+    proxy: Optional[str] = None,
+    priority: int = 0,
+    traffic_class: str = "foreground",
+) -> dict:
     """번역 경로: 영상의 자동/수동 자막 한 트랙을 골라 youtube-transcript-api의 tlang(자동번역)으로
     target_lang 번역본을 1회 요청한다. 원본 언어 트랙만 존재하는 영상(대부분)에서 임의 언어 자막을
     얻기 위한 용도. 예전 yt-dlp "lang-.*" 대량 번역과 달리 목표 언어 1개만 받아 429 부담이 낮다.
     target_lang이 이미 네이티브로 존재하면 번역 없이 그 트랙을 그대로 반환한다.
     proxy 명시(pause degrade): 그 프록시로 강제 + 경량 페이싱, 직결 폴백 없음."""
     via_proxy = proxy is not None
-    (_proxy_pace if via_proxy else _tapi_throttle)()
-    ytt = _ytt(proxy=proxy)
-    try:
-        tlist = ytt.list(video_id)
-    except Exception as exc:
-        if via_proxy or not (_PROXY_POOL and _is_proxy_quota_error(exc)):
-            raise
-        print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(transcript-list, {video_id}): {exc}", flush=True)
-        _tapi_throttle()
-        tlist = _ytt(force_direct=True).list(video_id)
+    with (_proxy_pace if via_proxy else _tapi_throttle)("transcript-translate-list", video_id, priority, traffic_class):
+        ytt = _ytt(proxy=proxy)
+        try:
+            tlist = ytt.list(video_id)
+        except Exception as exc:
+            if via_proxy or not (_PROXY_POOL and _is_proxy_quota_error(exc)):
+                raise
+            print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(transcript-list, {video_id}): {exc}", flush=True)
+            with _tapi_throttle("transcript-translate-list-direct-retry", video_id, priority, traffic_class):
+                tlist = _ytt(force_direct=True).list(video_id)
 
     available_subs: list[str] = []
     available_auto: list[str] = []
@@ -921,7 +1123,7 @@ def _translate_via_transcript_api(video_id: str, target_lang: str, proxy: Option
     }
 
 
-def _translate_fetch_sync(video_id: str, target_lang: str, auto: bool, include_segments: bool) -> dict:
+def _translate_fetch_sync(video_id: str, target_lang: str, auto: bool, include_segments: bool, priority: int = 0, traffic_class: str = "foreground") -> dict:
     """번역 경로 실행 + 캐시. 번역본은 네이티브 트랙과 캐시 충돌을 피하려 lang 키를 "t:<lang>"로 분리한다.
     transcript-api translate는 YouTube timedtext 쓰로틀/일시 오류로 첫 시도가 빈 응답/실패하는 일이
     잦아 최대 3회 재시도한다(재시도 없으면 리더가 '자막 못 받음' 에러만 뜨고 언어가 안 바뀜)."""
@@ -930,7 +1132,7 @@ def _translate_fetch_sync(video_id: str, target_lang: str, auto: bool, include_s
     attempts = 5
     for attempt in range(attempts):
         try:
-            result = _translate_via_transcript_api(video_id, target_lang)
+            result = _translate_via_transcript_api(video_id, target_lang, priority=priority, traffic_class=traffic_class)
             break
         except Exception as error:  # HTTPException(422 등)·네트워크·XML 파싱(쓰로틀 응답) 모두 포함
             last_error = error
@@ -961,7 +1163,7 @@ def _proxy_degrade_log(video_id: str, path: str, nbytes: int, ok: bool):
     print(f"[proxy-degrade] {video_id} / {path} / {nbytes}B / {'ok' if ok else 'fail'}", flush=True)
 
 
-def _degrade_fetch_sync(video_id: str, lang: str, auto: bool, translate: bool) -> dict:
+def _degrade_fetch_sync(video_id: str, lang: str, auto: bool, translate: bool, priority: int = 0) -> dict:
     """pause 중 프록시 경유 자막 페치(항상 full result 반환 = segments 포함, 상위에서 정형).
     성공 결과는 캐시에 저장해 이후(직결 회복 후 포함) 재요청 시 YouTube를 안 때리게 한다."""
     proxy = _pick_proxy()
@@ -969,10 +1171,10 @@ def _degrade_fetch_sync(video_id: str, lang: str, auto: bool, translate: bool) -
     nbytes, ok = 0, False
     try:
         if translate:
-            result = _translate_via_transcript_api(video_id, lang, proxy=proxy)
+            result = _translate_via_transcript_api(video_id, lang, proxy=proxy, priority=priority, traffic_class="foreground")
             _subtitle_cache_put(video_id, f"t:{lang}", auto, result)
         else:
-            result = _fetch_via_transcript_api(video_id, lang, auto, proxy=proxy)
+            result = _fetch_via_transcript_api(video_id, lang, auto, proxy=proxy, priority=priority, traffic_class="foreground")
             _subtitle_cache_put(video_id, lang, auto, result)
         nbytes = len(result.get("subtitles", "").encode("utf-8"))
         ok = True
@@ -991,12 +1193,12 @@ def _degrade_fetch_sync(video_id: str, lang: str, auto: bool, translate: bool) -
         _proxy_degrade_log(video_id, path, nbytes, ok)
 
 
-def _degrade_languages_sync(video_id: str) -> dict:
+def _degrade_languages_sync(video_id: str, priority: int = 0) -> dict:
     """pause 중 프록시 경유 언어목록 조회. 실패 시 yt-dlp /info 폴백 없이 retryable 503."""
     proxy = _pick_proxy()
     ok = False
     try:
-        result = _fetch_languages_sync(video_id, proxy=proxy)
+        result = _fetch_languages_sync(video_id, proxy=proxy, priority=priority, traffic_class="foreground")
         ok = True
         return result
     except HTTPException:
@@ -1032,30 +1234,33 @@ async def _run_fetch(video_id: str, lang: str, auto: bool, priority: int, transl
     (여기 도달했다는 건 캐시 미스라는 뜻 — 캐시 히트는 상위 fetch_subtitles에서 pause와 무관하게 이미 응답됨.)"""
     # ── pause(직결 IP 밴) 중: 프록시 풀이 있으면 프록시 경유 경량 degrade, 없으면 503(_guard_paused).
     #    직결 프로브 2회 성공 시 자동 회복되므로, 회복되면 이 분기를 빠져 자연히 직결 경로로 복귀한다.
+    traffic_class = "warm" if priority <= WARM_PRIORITY else "foreground"
     if _pause_remaining() > 0:
         if not _PROXY_POOL:
             _guard_paused()  # 풀 없음 → 기존처럼 503(Retry-After)
-        return await loop.run_in_executor(fast_executor, _degrade_fetch_sync, video_id, lang, auto, translate)
+        if traffic_class == "warm":
+            _guard_paused()
+        return await loop.run_in_executor(fast_executor, _degrade_fetch_sync, video_id, lang, auto, translate, priority)
+
+    if _UPSTREAM_SCHEDULER.proxy_overflow_available(traffic_class):
+        return await loop.run_in_executor(fast_executor, _degrade_fetch_sync, video_id, lang, auto, translate, priority)
 
     # ── 번역 경로: transcript-api tlang 단일요청만 사용(원본 트랙이 없는 언어용). yt-dlp 폴백 없음.
     if translate:
-        return await loop.run_in_executor(fast_executor, _translate_fetch_sync, video_id, lang, auto, True)
+        return await loop.run_in_executor(fast_executor, _translate_fetch_sync, video_id, lang, auto, True, priority, traffic_class)
 
     # ── 빠른 경로: youtube-transcript-api(timedtext 직접). 실패(자막없음/IP차단/네트워크/짧음)하면
     #    아래 yt-dlp 경로(쿠키+POT+스로틀)로 폴백한다.
     try:
-        return await loop.run_in_executor(fast_executor, _fast_fetch_sync, video_id, lang, auto, True)
+        return await loop.run_in_executor(fast_executor, _fast_fetch_sync, video_id, lang, auto, True, priority, traffic_class)
     except HTTPException:
         raise  # 처리 예산 소진(503) 등은 폴백(다른 경로 재시도) 말고 그대로 전파 — 예산 우회 방지
     except Exception as e:
         _tapi_mark_fail()  # 빠른 경로 실패=쓰로틀 징후 → transcript-api 쿨다운
+        _note_direct_block(video_id, "transcript-api", e)
         print(f"[transcript-api] fallback→yt-dlp ({video_id}): {type(e).__name__}: {e}", flush=True)
 
-    await gate.acquire(priority)
-    try:
-        return await loop.run_in_executor(executor, _fetch_subtitles_sync, video_id, lang, auto, True)
-    finally:
-        await gate.release()
+    return await loop.run_in_executor(executor, _fetch_subtitles_sync, video_id, lang, auto, True, priority, traffic_class)
 
 
 async def fetch_subtitles(video_id: str, lang: str, auto: bool, include_segments: bool = False, priority: int = 0, translate: bool = False) -> dict:
@@ -1107,7 +1312,8 @@ def _run_ytdlp_for_url(url: str, date_compact: str, start_pos: int, end_pos: int
         url,
     ]
     try:
-        proc = subprocess.run(["yt-dlp"] + args, capture_output=True, text=True, timeout=120)
+        with _yt_throttle("yt-dlp-channel", None, 0, "foreground"):
+            proc = subprocess.run(["yt-dlp"] + args, capture_output=True, text=True, timeout=120)
         stdout = proc.stdout
     except subprocess.TimeoutExpired:
         return []
@@ -1199,21 +1405,21 @@ def _fetch_channel_videos_sync(channel_url: str, date: str, include_shorts: bool
     return results
 
 
-def _fetch_info_sync(video_id: str) -> dict:
+def _fetch_info_sync(video_id: str, priority: int = 0, traffic_class: str = "foreground") -> dict:
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
         ydl_opts = {"skip_download": True, "quiet": True, "no_warnings": True, **_yt_retry_opts()}
-        _yt_throttle()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with _yt_throttle("yt-dlp-info-endpoint", video_id, priority, traffic_class):
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
     except Exception as exc:
         if not (_PROXY_POOL and _is_proxy_quota_error(exc)):
             raise
         print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(info-endpoint, {video_id}): {exc}", flush=True)
         ydl_opts = {"skip_download": True, "quiet": True, "no_warnings": True, **_yt_retry_opts(force_direct=True)}
-        _yt_throttle()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with _yt_throttle("yt-dlp-info-endpoint-direct-retry", video_id, priority, traffic_class):
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
     return {
         "video_id": video_id,
         "title": info.get("title"),
@@ -1226,22 +1432,22 @@ def _fetch_info_sync(video_id: str) -> dict:
     }
 
 
-def _fetch_languages_sync(video_id: str, proxy: Optional[str] = None) -> dict:
+def _fetch_languages_sync(video_id: str, proxy: Optional[str] = None, priority: int = 0, traffic_class: str = "foreground") -> dict:
     """사용 가능한 자막 언어 목록만 빠르게 조회한다. yt-dlp /info(영상 통째 probe, 수 초~수십 초)보다
     youtube-transcript-api list()가 훨씬 빠르다(timedtext 목록 1회). translation_targets는 번역
     가능한 트랙의 translation_languages(자동번역 대상 전체 목록)에서 모은다(리더 언어 메뉴용).
     proxy 명시(pause degrade): 그 프록시로 강제 + 경량 페이싱, 직결 폴백 없음."""
     via_proxy = proxy is not None
-    (_proxy_pace if via_proxy else _tapi_throttle)()
-    ytt = _ytt(proxy=proxy)
-    try:
-        tlist = ytt.list(video_id)
-    except Exception as exc:
-        if via_proxy or not (_PROXY_POOL and _is_proxy_quota_error(exc)):
-            raise
-        print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(transcript-list, {video_id}): {exc}", flush=True)
-        _tapi_throttle()
-        tlist = _ytt(force_direct=True).list(video_id)
+    with (_proxy_pace if via_proxy else _tapi_throttle)("languages-list", video_id, priority, traffic_class):
+        ytt = _ytt(proxy=proxy)
+        try:
+            tlist = ytt.list(video_id)
+        except Exception as exc:
+            if via_proxy or not (_PROXY_POOL and _is_proxy_quota_error(exc)):
+                raise
+            print(f"[proxy] 예비 프록시 실패 → 메인 직결 재시도(transcript-list, {video_id}): {exc}", flush=True)
+            with _tapi_throttle("languages-list-direct-retry", video_id, priority, traffic_class):
+                tlist = _ytt(force_direct=True).list(video_id)
     native: list[str] = []
     auto: list[str] = []
     targets: dict[str, bool] = {}
@@ -1272,6 +1478,10 @@ def root():
         "status": "ok",
         "message": "YouTube Subtitle API is running 🎬",
         "max_concurrent": MAX_CONCURRENT,
+        "proxy_mode": _proxy_mode(),
+        "proxy_pool_size": len(_PROXY_POOL),
+        "pause_remaining_seconds": int(_pause_remaining()),
+        "upstream": _UPSTREAM_SCHEDULER.snapshot(),
     }
 
 
@@ -1302,7 +1512,7 @@ async def get_subtitles(
     except HTTPException:
         raise
     except yt_dlp.utils.DownloadError as e:
-        raise _map_download_error(e)
+        raise _map_download_error(e, video_id, "endpoint-subtitles")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"자막 추출 오류: {str(e)}")
 
@@ -1420,9 +1630,9 @@ async def get_video_info(
 
     try:
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(executor, _fetch_info_sync, video_id)
+        result = await loop.run_in_executor(executor, _fetch_info_sync, video_id, 0, "foreground")
     except yt_dlp.utils.DownloadError as e:
-        raise _map_download_error(e)
+        raise _map_download_error(e, video_id, "endpoint-info")
 
     return result
 
@@ -1449,18 +1659,21 @@ async def get_languages(
     if _pause_remaining() > 0:
         if not _PROXY_POOL:
             _guard_paused()
-        return await loop.run_in_executor(fast_executor, _degrade_languages_sync, video_id)
+        return await loop.run_in_executor(fast_executor, _degrade_languages_sync, video_id, 0)
+
+    if _UPSTREAM_SCHEDULER.proxy_overflow_available("foreground"):
+        return await loop.run_in_executor(fast_executor, _degrade_languages_sync, video_id, 0)
 
     try:
-        return await loop.run_in_executor(fast_executor, _fetch_languages_sync, video_id)
+        return await loop.run_in_executor(fast_executor, _fetch_languages_sync, video_id, None, 0, "foreground")
     except HTTPException:
         raise  # 처리 예산 소진(503) 등은 yt-dlp /info 폴백 말고 그대로 전파
     except Exception as fast_error:
         print(f"[languages] transcript-api 실패→yt-dlp /info 폴백 ({video_id}): {type(fast_error).__name__}", flush=True)
         try:
-            result = await loop.run_in_executor(executor, _fetch_info_sync, video_id)
+            result = await loop.run_in_executor(executor, _fetch_info_sync, video_id, 0, "foreground")
         except yt_dlp.utils.DownloadError as e:
-            raise _map_download_error(e)
+            raise _map_download_error(e, video_id, "endpoint-languages-info")
         # /info엔 translation_targets가 없으니 auto 목록을 대체로 쓴다(yt-dlp auto엔 자동번역 대상이 포함됨).
         result["translation_targets"] = result.get("available_auto_captions", [])
         _language_cache_put(video_id, result)  # /info 폴백 결과도 캐시(다음 조회는 즉답)
@@ -1474,36 +1687,62 @@ async def get_languages(
 # ─────────────────────────────────────────────
 PAUSE_PROBE_INTERVAL = float(os.environ.get("PAUSE_PROBE_INTERVAL", "1800"))  # 감시 주기(초, 기본 30분)
 PAUSE_PROBE_VIDEO = os.environ.get("PAUSE_PROBE_VIDEO", "dQw4w9WgXcQ")        # 회복 판정용 프로브 영상(항상 자막 있음)
+PAUSE_PROBE_CONFIRM_DELAY = float(os.environ.get("PAUSE_PROBE_CONFIRM_DELAY", "20"))
+PAUSE_PROBE_BACKOFF_MAX = float(os.environ.get("PAUSE_PROBE_BACKOFF_MAX", "7200"))
 
 
 def _clear_pause():
+    with _pause_lock:
+        try:
+            os.remove(PAUSE_FILE)
+        except FileNotFoundError:
+            pass
+
+
+def _proxy_mode() -> str:
+    if _proxy_forced():
+        return "forced-proxy"
+    if _pause_remaining() > 0 and _PROXY_POOL:
+        return "proxy-degrade"
+    if _pause_remaining() > 0:
+        return "paused-no-proxy"
+    return "direct"
+
+
+async def _probe_direct_recovery_once(loop, confirm_delay: float = 20.0) -> bool:
+    # 캐시 우회(_fetch_subtitles_uncached 직접) → 실제 YouTube 히트로만 회복 판정.
+    # 429는 확률적이라 한 번 우연히 뚫릴 수 있으므로, 두 번 연속 성공해야 해제한다.
     try:
-        os.remove(PAUSE_FILE)
-    except FileNotFoundError:
-        pass
+        await loop.run_in_executor(executor, _fetch_subtitles_uncached, PAUSE_PROBE_VIDEO, "en", True, 10, "probe")
+    except Exception as e:
+        print(f"[pause] 아직 회복 안 됨(계속 대기): {type(e).__name__}", flush=True)
+        return False
+    await asyncio.sleep(confirm_delay)
+    try:
+        await loop.run_in_executor(executor, _fetch_subtitles_uncached, PAUSE_PROBE_VIDEO, "en", True, 10, "probe")
+    except Exception as e:
+        print(f"[pause] 1차 성공했으나 확인 프로브 실패({type(e).__name__}) → 아직 불안정, 대기 유지", flush=True)
+        return False
+    _clear_pause()
+    _UPSTREAM_SCHEDULER.note_recovery()
+    print("[pause] IP 회복 확인(2회 연속) → 일시정지 자동 해제(자막 페치 재개)", flush=True)
+    return True
 
 
 async def _pause_auto_recover_loop():
     loop = asyncio.get_event_loop()
+    probe_interval = PAUSE_PROBE_INTERVAL
     while True:
-        await asyncio.sleep(PAUSE_PROBE_INTERVAL)
-        if _pause_remaining() <= 0:
+        await asyncio.sleep(probe_interval)
+        remaining = _pause_remaining()
+        if remaining <= 0:
+            probe_interval = PAUSE_PROBE_INTERVAL
             continue  # 정지 중이 아니면 스킵(재개 후엔 놀고 있음)
-        # 캐시 우회(_fetch_subtitles_uncached 직접) → 실제 YouTube 히트로만 회복 판정.
-        # 429는 확률적이라 한 번 우연히 뚫릴 수 있으므로, 20s 간격 2회 연속 성공해야 해제한다(조기해제 방지).
-        try:
-            await loop.run_in_executor(executor, _fetch_subtitles_uncached, PAUSE_PROBE_VIDEO, "en", True)
-        except Exception as e:
-            print(f"[pause] 아직 회복 안 됨(계속 대기): {type(e).__name__}", flush=True)
-            continue
-        await asyncio.sleep(20)
-        try:
-            await loop.run_in_executor(executor, _fetch_subtitles_uncached, PAUSE_PROBE_VIDEO, "en", True)
-        except Exception as e:
-            print(f"[pause] 1차 성공했으나 확인 프로브 실패({type(e).__name__}) → 아직 불안정, 대기 유지", flush=True)
-            continue
-        _clear_pause()
-        print("[pause] IP 회복 확인(2회 연속) → 일시정지 자동 해제(자막 페치 재개)", flush=True)
+        if await _probe_direct_recovery_once(loop, PAUSE_PROBE_CONFIRM_DELAY):
+            probe_interval = PAUSE_PROBE_INTERVAL
+        else:
+            probe_interval = min(probe_interval * 2, PAUSE_PROBE_BACKOFF_MAX)
+            print(f"[pause] 다음 회복 프로브 {int(probe_interval)}s 후(백오프)", flush=True)
 
 
 # ─────────────────────────────────────────────

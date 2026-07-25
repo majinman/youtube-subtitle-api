@@ -29,12 +29,42 @@ uvicorn main:app --reload --port 8000
 
 - 기본값은 프록시 OFF(집 IP 직결)입니다.
 - `proxies.txt`(또는 `PROXY_LIST`)는 항상 로드되지만 평상시엔 사용하지 않습니다.
-- **IP 밴(pause) 중에만 자동 degrade**: `youtube_pause_until`이 활성일 때 503 대신 프록시 경유 경량 경로(transcript-api만, yt-dlp 폴백 없음, 1s 페이싱)로 요청을 살립니다. 회복 프로브가 직결 성공을 확인하면 자동으로 직결 복귀합니다.
+- 모든 YouTube upstream hit(`yt-dlp`, `youtube-transcript-api`, `/info`, `/languages`, `/channel/videos`, `/warm`)는 프로세스 전역 `UpstreamScheduler`를 통과합니다. 기본 direct lane은 `UPSTREAM_DIRECT_CONCURRENCY=1`, `UPSTREAM_DIRECT_RPM=8`, `UPSTREAM_DIRECT_BURST=2`로 집 IP 버스트를 막습니다.
+- foreground 요청은 direct lane 포화/대기 중일 때 비용 제한 proxy overflow를 쓸 수 있습니다. proxy lane 기본값은 `UPSTREAM_PROXY_CONCURRENCY=1`, `UPSTREAM_PROXY_RPM=12`, `UPSTREAM_PROXY_BURST=2`, `UPSTREAM_PROXY_HOURLY_CAP=120`입니다.
+- warm/background 트래픽은 proxy overflow를 절대 사용하지 않고, direct capacity를 `UPSTREAM_WARM_MAX_WAIT`(기본 2s) 이상 기다려야 하면 retryable 503으로 홀드합니다.
+- **IP 밴(pause) 중 degrade**: `youtube_pause_until`이 활성일 때 foreground 캐시 미스는 프록시 경유 경량 경로(transcript-api만, yt-dlp 폴백 없음)로 요청을 살립니다. 회복 프로브가 직결 2회 성공을 확인하면 자동으로 직결 복귀합니다.
+- 자동 failover: `AUTO_PROXY_FAILOVER=1`(기본)이고 프록시 풀이 있을 때, 직결 경로에서 credible block(`IpBlocked` 또는 반복 `429`)이 `DIRECT_BLOCK_THRESHOLD`회(`DIRECT_BLOCK_WINDOW`초 안) 관찰되면 `AUTO_PROXY_PAUSE_SECONDS` 동안만 pause를 설정합니다. pause는 `AUTO_PROXY_MAX_PAUSE_SECONDS`를 넘기지 않습니다.
 - 캐시 히트는 pause 중에도 즉시 응답합니다(YouTube를 안 때리므로).
 - `USE_PROXY_POOL=1`은 "항상 프록시" 강제 오버라이드입니다. 이때도 yt-dlp는 재시도 1회 + 쿠키 제외로 경량 운용됩니다(재시도 5회 × 프록시 조합이 과거 1GB 소진의 주범).
 - 프록시 quota/결제 문제(`402 Payment Required`, tunnel proxy 실패) 시 해당 요청은 메인 직결로 한 번 재시도합니다.
 - 프록시 경유 요청은 `[proxy-degrade] video_id/경로/바이트/성공여부` 로그로 계측됩니다.
+- 자동 전환/복귀와 queue pressure는 `[upstream]`, `[proxy-failover]`, `[pause]` 로그와 `/` health의 `proxy_mode`, `proxy_pool_size`, `pause_remaining_seconds`, `upstream.direct`, `upstream.proxy`, `upstream.metrics`로 확인합니다.
 - 트래픽 실측·최적화 이력은 `THROTTLE-LEARNINGS.md` 참고 (영상당 바이트의 정체는 watch/player HTML, 2026-07-24 yt-dlp 경로 50% 절감 + /languages 영구 캐시).
+
+### UpstreamScheduler 설정
+
+| 환경변수 | 기본값 | 설명 |
+|---------|--------|------|
+| `UPSTREAM_DIRECT_CONCURRENCY` | `1` | 직결 YouTube upstream 동시 실행 수. `yt-dlp`와 transcript-api가 공유합니다. |
+| `UPSTREAM_DIRECT_RPM` | `8` | 직결 lane 분당 admit 수. |
+| `UPSTREAM_DIRECT_BURST` | `2` | 직결 lane 순간 허용 버스트. |
+| `UPSTREAM_DIRECT_MAX_WAIT` | `45` | foreground가 direct lane을 기다릴 최대 시간. 초과 시 503 또는 proxy overflow 후보가 됩니다. |
+| `UPSTREAM_WARM_MAX_WAIT` | `2` | warm/preload가 direct lane을 기다릴 최대 시간. 초과 시 503으로 큐를 홀드합니다. |
+| `UPSTREAM_PROXY_CONCURRENCY` | `1` | proxy overflow/degrade 동시 실행 수. |
+| `UPSTREAM_PROXY_RPM` | `12` | proxy lane 분당 admit 수. |
+| `UPSTREAM_PROXY_BURST` | `2` | proxy lane 순간 허용 버스트. |
+| `UPSTREAM_PROXY_MAX_WAIT` | `15` | foreground proxy lane 최대 대기 시간. |
+| `UPSTREAM_PROXY_HOURLY_CAP` | `120` | 프로세스 메모리 기준 시간당 proxy admit 상한. PM2 재시작 시 카운터는 초기화됩니다. |
+| `UPSTREAM_PROXY_OVERFLOW_QUEUE` | `1` | direct active+queued 수가 이 값 이상이면 foreground proxy overflow를 허용합니다. |
+
+`priority` 값이 높을수록 같은 lane 안에서 먼저 admit됩니다. 기본 foreground는 `0`, `/warm` 소비자는 `WARM_PRIORITY=-1`, 회복 probe는 `10`입니다.
+
+### 운영상 한계
+
+- 스케줄러와 proxy hourly cap은 단일 프로세스 메모리 상태입니다. PM2 cluster/multi-process로 늘리면 프로세스 간 공유 cap이 아니므로 별도 외부 락/카운터가 필요합니다.
+- `/channel/videos`는 subprocess 실행 단위로 한 번 admit하지만, `yt-dlp` 내부에서 여러 YouTube HTTP 요청을 만들 수 있습니다.
+- YouTube는 실제 unban 시각을 제공하지 않습니다. `youtube_pause_until`은 로컬 cooldown과 routing hint일 뿐이며, 회복은 direct probe 2회 성공으로만 확정합니다.
+- proxy degrade는 transcript-api 경량 경로만 사용합니다. 영상이 transcript-api로 받을 수 없는 상태면 retryable 503이 정상 동작입니다.
 
 ## API 엔드포인트
 
