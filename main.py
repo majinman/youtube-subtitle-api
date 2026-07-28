@@ -832,6 +832,82 @@ def _language_cache_put(video_id: str, result: dict):
         _cache_conn.commit()
 
 
+# ── 네거티브 캐시 (sqlite) ──────────────────────────────────────────────────
+# "자막이 없다 / 영상이 없다" 같은 terminal 실패는 다시 물어봐도 답이 같은데, 저장하지 않으면
+# 소비자(RT 워커·tubeletter)가 실패를 retryable로 보고 같은 영상을 무한 재요청한다. 그 한 번마다
+# transcript-api list()가 watch HTML ~345KB를 받고(2026-07-24 실측), 직결 IP 밴 중이면 그게 전부
+# 유료 프록시 GB로 나간다 — 2026-07-28 실측: 프록시 호출 861건 중 625건(73%)이 자막 0바이트로 끝난
+# 같은 영상 반복(JbXAEzhsE18 135회 등)이었다. terminal 실패를 캐시해 그 재시도를 YouTube 앞에서 끊는다.
+# TTL: 422(실제 자막 목록을 보고 내린 "자막 없음")는 영구(0), 403/404(비공개·삭제 등)는 되돌아올
+#      여지가 있어 7일, 409(라이브 시작 전)는 곧 바뀌므로 1시간. 429/503(밴·쓰로틀)은 절대 캐시 안 함.
+# ⚠️ 단, 프록시 degrade로 얻은 실패는 신뢰도가 낮아 위 TTL을 쓰지 않는다(_DEGRADE_NEGATIVE_TTL).
+#    2026-07-28 실증: transcript-api가 TranscriptsDisabled로 보고한 16개 영상 중 8개가 나중에 같은
+#    경로로 정상 수신됐다 — 차단 IP/프록시가 봇체크 페이지를 받으면 라이브러리가 "자막 비활성화"로
+#    오보한다. 이걸 영구 캐시하면 멀쩡한 영상을 영구히 죽인다. 루프만 끊고 스스로 낫게 짧게 잡는다.
+_NEGATIVE_TTL_BY_STATUS = {422: 0.0, 403: 604800.0, 404: 604800.0, 409: 3600.0}
+_DEGRADE_NEGATIVE_TTL = float(os.environ.get("DEGRADE_NEGATIVE_TTL", "21600"))  # 6시간
+
+
+class TerminalError(HTTPException):
+    """네거티브 캐시 TTL을 직접 들고 다니는 terminal 실패(상태코드 기본 TTL을 덮어쓴다)."""
+
+    def __init__(self, status_code: int, detail: str, cache_ttl: float):
+        super().__init__(status_code=status_code, detail=detail)
+        self.cache_ttl = cache_ttl
+_cache_conn.execute(
+    "CREATE TABLE IF NOT EXISTS negative_cache ("
+    " video_id TEXT, lang TEXT, auto INTEGER, status INTEGER, detail TEXT,"
+    " created_at REAL, expires_at REAL, PRIMARY KEY (video_id, lang, auto))"
+)
+_cache_conn.commit()
+
+
+def _negative_cache_get(video_id: str, lang: str, auto: bool) -> Optional[HTTPException]:
+    """terminal 실패가 기록돼 있으면 그 HTTPException을 돌려준다(=YouTube 무접촉 즉시 응답)."""
+    with _cache_lock:
+        row = _cache_conn.execute(
+            "SELECT status, detail, expires_at FROM negative_cache"
+            " WHERE video_id=? AND lang=? AND auto=?",
+            (video_id, lang, int(auto)),
+        ).fetchone()
+    if not row:
+        return None
+    status, detail, expires_at = row
+    if expires_at and expires_at <= time.time():
+        with _cache_lock:
+            _cache_conn.execute(
+                "DELETE FROM negative_cache WHERE video_id=? AND lang=? AND auto=?",
+                (video_id, lang, int(auto)),
+            )
+            _cache_conn.commit()
+        return None
+    return HTTPException(status_code=int(status), detail=detail)
+
+
+def _negative_cache_put(video_id: str, lang: str, auto: bool, exc: HTTPException) -> None:
+    """terminal 상태코드만 저장한다(429/503 등 일시적 실패는 _NEGATIVE_TTL_BY_STATUS에 없어 무시)."""
+    ttl = getattr(exc, "cache_ttl", None)
+    if ttl is None:
+        ttl = _NEGATIVE_TTL_BY_STATUS.get(exc.status_code)
+    if ttl is None:
+        return
+    now = time.time()
+    expires_at = 0.0 if ttl == 0 else now + ttl
+    with _cache_lock:
+        _cache_conn.execute(
+            "INSERT OR REPLACE INTO negative_cache"
+            " (video_id, lang, auto, status, detail, created_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (video_id, lang, int(auto), int(exc.status_code), str(exc.detail), now, expires_at),
+        )
+        _cache_conn.commit()
+    print(
+        f"[negative-cache] 기록 {video_id}/{lang} status={exc.status_code} "
+        f"ttl={'permanent' if ttl == 0 else int(ttl)}",
+        flush=True,
+    )
+
+
 def _fetch_subtitles_sync(
     video_id: str,
     lang: str,
@@ -1163,6 +1239,30 @@ def _proxy_degrade_log(video_id: str, path: str, nbytes: int, ok: bool):
     print(f"[proxy-degrade] {video_id} / {path} / {nbytes}B / {'ok' if ok else 'fail'}", flush=True)
 
 
+def _terminal_transcript_error(exc: Exception) -> Optional[TerminalError]:
+    """transcript-api 예외 중 "당분간 다시 물어봐도 같은 답"인 것을 terminal 상태코드로 바꾼다.
+    degrade 경로는 yt-dlp 폴백이 없어 이걸 전부 503으로 뭉갰고, 그 503이 소비자 무한 재시도 →
+    프록시 GB 소진의 직접 원인이었다. IpBlocked/RequestBlocked(밴)는 일시적이라 제외.
+    TTL은 짧게(_DEGRADE_NEGATIVE_TTL) — 이 경로의 진단은 봇체크 페이지에 속을 수 있어 영구 금지."""
+    name = type(exc).__name__
+    if name == "TranscriptsDisabled":
+        return TerminalError(422, "자막이 비활성화된 영상입니다.", _DEGRADE_NEGATIVE_TTL)
+    if name == "NoTranscriptFound":
+        return TerminalError(422, "요청한 언어의 자막이 없습니다.", _DEGRADE_NEGATIVE_TTL)
+    if name in {"VideoUnavailable", "VideoUnplayable"}:
+        return TerminalError(404, "영상을 볼 수 없습니다(삭제/비공개/지역제한).", _DEGRADE_NEGATIVE_TTL)
+    if name == "AgeRestricted":
+        return TerminalError(403, "연령 제한 영상이라 자막을 받을 수 없습니다.", _DEGRADE_NEGATIVE_TTL)
+    return None
+
+
+def _bounded_terminal(exc: HTTPException) -> HTTPException:
+    """프록시 degrade 경로가 올린 terminal 실패에 짧은 TTL을 강제한다(영구 오염 방지)."""
+    if isinstance(exc, TerminalError) or exc.status_code not in _NEGATIVE_TTL_BY_STATUS:
+        return exc
+    return TerminalError(exc.status_code, str(exc.detail), _DEGRADE_NEGATIVE_TTL)
+
+
 def _degrade_fetch_sync(video_id: str, lang: str, auto: bool, translate: bool, priority: int = 0) -> dict:
     """pause 중 프록시 경유 자막 페치(항상 full result 반환 = segments 포함, 상위에서 정형).
     성공 결과는 캐시에 저장해 이후(직결 회복 후 포함) 재요청 시 YouTube를 안 때리게 한다."""
@@ -1179,10 +1279,15 @@ def _degrade_fetch_sync(video_id: str, lang: str, auto: bool, translate: bool, p
         nbytes = len(result.get("subtitles", "").encode("utf-8"))
         ok = True
         return result
-    except HTTPException:
+    except HTTPException as e:
         # 422(자막 없음) 등 의미 있는 상태는 그대로 전파(yt-dlp 폴백 안 함).
-        raise
+        # 단 이 경로의 판정은 프록시가 받은 페이지에 의존하므로 캐시 TTL은 짧게 묶는다.
+        raise _bounded_terminal(e)
     except Exception as e:
+        # 자막 없음/영상 없음 등 terminal 실패는 제 상태코드로 올려 네거티브 캐시에 남게 한다.
+        terminal = _terminal_transcript_error(e)
+        if terminal is not None:
+            raise terminal
         # transcript-api 실패(쓰로틀/네트워크/파싱) → 무거운 yt-dlp를 프록시로 태우지 않고 retryable 503.
         raise HTTPException(
             status_code=503,
@@ -1272,6 +1377,12 @@ async def fetch_subtitles(video_id: str, lang: str, auto: bool, include_segments
     if cached is not None:
         return _shape_result(cached, include_segments)
 
+    # terminal 실패(자막 없음/영상 없음)로 기록된 영상은 여기서 끊는다 — pause/degrade 분기 이전이라
+    # 소비자가 아무리 재시도해도 YouTube(=프록시 GB)를 한 바이트도 쓰지 않는다.
+    negative = _negative_cache_get(video_id, cache_lang, auto)
+    if negative is not None:
+        raise negative
+
     # 같은 요청이 이미 진행 중이면 그 결과를 공유한다(중복 페치 방지). 단일 이벤트루프라
     # get→create→set 사이에 await가 없어 경쟁 없이 원자적이다.
     key = (video_id, cache_lang, auto)
@@ -1288,6 +1399,8 @@ async def fetch_subtitles(video_id: str, lang: str, auto: bool, include_segments
             fut.set_result(result)
         return _shape_result(result, include_segments)
     except BaseException as e:
+        if isinstance(e, HTTPException):
+            _negative_cache_put(video_id, cache_lang, auto, e)
         if not fut.done():
             fut.set_exception(e)
         raise

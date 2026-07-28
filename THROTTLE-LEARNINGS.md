@@ -87,3 +87,35 @@ stage1 `info` dict에 timedtext URL(vtt 포함)이 **이미 다 들어있다**. 
 
 ## 프리워밍은 게이트웨이가 조율 — `POST /warm` 힌트 API (2026-07-24)
 소비자(tubeletter·rt)가 각자 `fetchSubtitles`를 직접 실행하던 프리워밍을 **수요 감지(소비자)+실행·조율(게이트웨이)**로 분리했다. `/warm`은 video_id만 받아 인메모리 큐에 넣고 백그라운드에서 최저 우선순위(-1)+전용 페이싱(20s)+기존 예산/스로틀 통과로 캐시한다. pause·429·예산소진 시 큐 홀드, pause 프록시 degrade엔 안 태움(프리워밍에 프록시 GB 안 씀). 여러 소비자 스케줄러가 서로 모른 채 예산을 두드리던 충돌을 제거.
+
+## 네거티브 캐시 — terminal 실패 재시도 폭풍 차단 (2026-07-28)
+
+**증상:** Webshare GB가 다시 소진(402 Payment Required). "요청이 많아서"가 아니라 **낭비율**이 문제였다.
+
+**실측(pm2 로그·게이트웨이 metrics):**
+| 관측 | 값 |
+|---|---|
+| foreground 요청 경로 | proxy 638 vs direct 21 → **97%가 유료 프록시** |
+| pause 재발동 | 132회 × 30분 ≈ **66시간 연속 proxy-degrade** |
+| 프록시 호출 성패 | 861건 중 **625건(73%) 실패, 자막 0바이트** |
+| 실패 집중 | JbXAEzhsE18 135회, T7zlSV9HmNw 87회, RclXprHi49Y 72회… 20개 영상 |
+| 에러 유형 | TranscriptsDisabled 1,776 / IpBlocked 312 / ProxyError(402) 66,334 |
+
+**원인 연쇄:** 집 IP timedtext 밴이 안 풀림 → pause가 30분마다 재무장돼 프록시가 상시 주경로 →
+degrade 경로는 yt-dlp 폴백이 없어 **모든 실패를 503(retryable)으로 뭉갬** → 소비자(RT 워커·tubeletter)가
+같은 영상을 무한 재큐 → 매 재시도마다 watch HTML ~345KB가 유료 대역으로 나감(자막은 0바이트).
+
+**적용:**
+1. `negative_cache`(sqlite, `subtitle_cache.db` 공유) — terminal 실패를 (video_id, lang, auto)로 기록.
+   `fetch_subtitles`가 **positive 캐시 다음, pause/degrade 분기 이전**에 조회해 즉시 raise → YouTube 무접촉.
+2. degrade 경로 예외 분류(`_terminal_transcript_error`) — TranscriptsDisabled/NoTranscriptFound/
+   VideoUnavailable/AgeRestricted를 503이 아니라 422/404/403으로 올린다. IpBlocked/RequestBlocked는 제외(일시적).
+3. TTL: 429/503은 **절대 캐시 안 함**. 직결 경로 422(실제 자막 목록 확인)는 영구. **프록시 degrade 판정은 6시간**(`DEGRADE_NEGATIVE_TTL`).
+
+**⚠️ 반드시 지킬 것 — TranscriptsDisabled는 terminal이 아니다.**
+이 16개를 "자막 없는 영상"으로 영구 시드하려다 확인해보니 **8개가 나중에 같은 transcript-api 경로로 정상 수신**돼
+subtitle_cache에 들어 있었다(JbXAEzhsE18 854KB 등). 차단된 IP/프록시가 봇체크 페이지를 받으면 라이브러리가
+그걸 "자막 비활성화"로 오보한다. **프록시 경유 진단으로 영구 판정을 내리면 멀쩡한 영상을 영구히 죽인다** →
+degrade 판정은 TTL로만 묶어 루프를 끊고 스스로 낫게 한다. (시드는 되돌렸고, 실패 진단으로 캐시를 채우지 않는다.)
+
+**검증:** `tests/test_negative_cache.py` 7개 + 기존 8개 통과. 라이브에서 네거티브 히트 시 upstream 로그 0건·422 즉답 확인.
