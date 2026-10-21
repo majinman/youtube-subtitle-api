@@ -845,6 +845,12 @@ def _language_cache_put(video_id: str, result: dict):
 #    경로로 정상 수신됐다 — 차단 IP/프록시가 봇체크 페이지를 받으면 라이브러리가 "자막 비활성화"로
 #    오보한다. 이걸 영구 캐시하면 멀쩡한 영상을 영구히 죽인다. 루프만 끊고 스스로 낫게 짧게 잡는다.
 _NEGATIVE_TTL_BY_STATUS = {422: 0.0, 403: 604800.0, 404: 604800.0, 409: 3600.0}
+# "자막이 없습니다"/"사용 가능한 자막이 없습니다"(422)는 업로드 직후 자동자막이 아직 안 만들어져서도 나온다.
+# 영구 캐시하던 시절 tubeletter가 업로드 20분 뒤 받은 이 답이 굳어, 몇 시간 뒤 자동자막이 생긴 메인 영상
+# 22건(30일)이 영구히 요약에서 빠졌다(2026-10-21 감사). 재시도 루프만 끊고 나중엔 다시 보게 1시간으로 둔다.
+# "자막이 비활성화된 영상"은 기다려도 같으니 그대로 영구다.
+_CAPTION_PENDING_DETAILS = {"자막이 없습니다.", "사용 가능한 자막이 없습니다."}
+_CAPTION_PENDING_NEGATIVE_TTL = float(os.environ.get("CAPTION_PENDING_NEGATIVE_TTL", "3600"))  # 1시간
 _DEGRADE_NEGATIVE_TTL = float(os.environ.get("DEGRADE_NEGATIVE_TTL", "21600"))  # 6시간
 
 
@@ -887,6 +893,8 @@ def _negative_cache_get(video_id: str, lang: str, auto: bool) -> Optional[HTTPEx
 def _negative_cache_put(video_id: str, lang: str, auto: bool, exc: HTTPException) -> None:
     """terminal 상태코드만 저장한다(429/503 등 일시적 실패는 _NEGATIVE_TTL_BY_STATUS에 없어 무시)."""
     ttl = getattr(exc, "cache_ttl", None)
+    if ttl is None and exc.status_code == 422 and str(exc.detail) in _CAPTION_PENDING_DETAILS:
+        ttl = _CAPTION_PENDING_NEGATIVE_TTL
     if ttl is None:
         ttl = _NEGATIVE_TTL_BY_STATUS.get(exc.status_code)
     if ttl is None:

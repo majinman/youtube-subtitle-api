@@ -50,14 +50,24 @@ class NegativeCacheTests(unittest.TestCase):
             self.gateway._negative_cache_put("vid00000001", "ko", True, self.HTTPException(status, "일시적"))
             self.assertIsNone(self.gateway._negative_cache_get("vid00000001", "ko", True))
 
-    def test_direct_no_subtitles_is_cached_permanently(self):
-        self.gateway._negative_cache_put("vid00000002", "ko", True, self.HTTPException(422, "사용 가능한 자막이 없습니다."))
+    def test_disabled_subtitles_is_cached_permanently(self):
+        self.gateway._negative_cache_put("vid00000002", "ko", True, self.HTTPException(422, "자막이 비활성화된 영상입니다."))
         hit = self.gateway._negative_cache_get("vid00000002", "ko", True)
         self.assertEqual(hit.status_code, 422)
         row = self.gateway._cache_conn.execute(
             "SELECT expires_at FROM negative_cache WHERE video_id='vid00000002'"
         ).fetchone()
         self.assertEqual(row[0], 0.0)  # 0 = 무기한
+
+    # 2026-10-21: 업로드 직후엔 자동자막이 아직 없어 "자막 없음"이 온다. 영구 캐시하면 영상이 영구히 빠진다.
+    def test_no_subtitles_yet_expires_in_an_hour(self):
+        for vid, detail in (("vid0000002a", "사용 가능한 자막이 없습니다."), ("vid0000002b", "자막이 없습니다.")):
+            self.gateway._negative_cache_put(vid, "ko", True, self.HTTPException(422, detail))
+            self.assertEqual(self.gateway._negative_cache_get(vid, "ko", True).status_code, 422)
+            created_at, expires_at = self.gateway._cache_conn.execute(
+                "SELECT created_at, expires_at FROM negative_cache WHERE video_id=?", (vid,)
+            ).fetchone()
+            self.assertAlmostEqual(expires_at - created_at, 3600, delta=1)
 
     def test_degrade_verdicts_expire(self):
         """프록시가 봇체크 페이지를 받으면 TranscriptsDisabled로 오보하므로 영구 캐시하면 안 된다
