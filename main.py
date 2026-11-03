@@ -28,6 +28,10 @@ app = FastAPI(
     title="YouTube Subtitle API",
     description="yt-dlp 기반 유튜브 자막 추출 API",
     version="3.0.0",
+    # 공개 호스트(yt-dlp.whoq.kr)라 API 문서·스키마는 노출하지 않는다 (2026-11-03 보안 점검)
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 # ─────────────────────────────────────────────
